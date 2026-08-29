@@ -21,6 +21,7 @@ use arrow_schema::{Schema, SchemaRef};
 use std::sync::Arc;
 
 use crate::columnar::bloom::BloomFilter;
+use crate::columnar::trigram;
 use crate::columnar::decode::{decode_column, BufferSource, SegmentBytes};
 use crate::columnar::encode::{compress_buffers, encode_column, EncodedColumn};
 use crate::columnar::page::{
@@ -92,12 +93,30 @@ pub fn build_segment(
         let encoded = encode_column(array.as_ref(), options)?;
         // Built here rather than inside the encoder, because whether a column
         // gets a filter is a question about its name, not about its values.
-        let bloom = if options.bloom_filters.covers(schema.field(index).name()) {
+        let name = schema.field(index).name();
+        let bloom = if options.bloom_filters.covers(name) {
             BloomFilter::build(array.as_ref(), options.bloom_bits_per_value)?
         } else {
             None
         };
-        chunks.push(write_chunk(&mut bytes, encoded, codec, bloom.as_ref())?);
+        let trigram = if options.trigram_filters.covers(name) {
+            // The column's own stored size is the budget, so a filter never
+            // outweighs the data it describes.
+            trigram::build(
+                array.as_ref(),
+                options.bloom_bits_per_value,
+                encoded.byte_len(),
+            )?
+        } else {
+            None
+        };
+        chunks.push(write_chunk(
+            &mut bytes,
+            encoded,
+            codec,
+            bloom.as_ref(),
+            trigram.as_ref(),
+        )?);
     }
 
     let meta = SegmentMeta {
@@ -156,6 +175,7 @@ fn write_chunk(
     encoded: EncodedColumn,
     codec: Codec,
     bloom: Option<&BloomFilter>,
+    trigram: Option<&BloomFilter>,
 ) -> Result<ColumnChunk> {
     let stored = compress_buffers(codec, &encoded.buffers)?;
 
@@ -182,15 +202,16 @@ fn write_chunk(
         });
     }
 
-    // Stored raw and after the loop above, so it takes no part in the codec
+    // Stored raw and after the loop above, so they take no part in the codec
     // decision. A filter is close to random bits, which no codec shrinks.
-    if let Some(filter) = bloom {
+    for (role, filter) in [(BufferRole::Bloom, bloom), (BufferRole::Trigram, trigram)] {
+        let Some(filter) = filter else { continue };
         pad_to_alignment(bytes);
         let offset = bytes.len() as u64;
         let stored = filter.to_bytes();
         bytes.extend_from_slice(&stored);
         specs.push(BufferSpec {
-            role: BufferRole::Bloom,
+            role,
             extent: Extent::new(offset, stored.len() as u64),
             uncompressed_len: stored.len() as u64,
             checksum: checksum(&stored),
@@ -200,7 +221,7 @@ fn write_chunk(
     let children = encoded
         .children
         .into_iter()
-        .map(|child| write_chunk(bytes, child, codec, None))
+        .map(|child| write_chunk(bytes, child, codec, None, None))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(ColumnChunk {
@@ -308,11 +329,20 @@ impl SegmentReader {
     /// Reads only the filter's bytes, not the column's. A segment written
     /// before filters were asked for simply has none, and reports `None`.
     pub fn bloom_filter(&self, index: usize) -> Result<Option<BloomFilter>> {
+        self.filter(index, BufferRole::Bloom)
+    }
+
+    /// The trigram filter for one column, when the segment stored one.
+    pub fn trigram_filter(&self, index: usize) -> Result<Option<BloomFilter>> {
+        self.filter(index, BufferRole::Trigram)
+    }
+
+    fn filter(&self, index: usize, role: BufferRole) -> Result<Option<BloomFilter>> {
         let meta = self.meta()?;
         let Some(chunk) = meta.columns.get(index) else {
             return Ok(None);
         };
-        let Some(spec) = chunk.buffer(BufferRole::Bloom) else {
+        let Some(spec) = chunk.buffer(role) else {
             return Ok(None);
         };
 

@@ -107,6 +107,11 @@ pub enum BufferRole {
     /// Not Arrow's; the decoder skips it. Pruning reads it to rule a segment
     /// out for an equality the zone map cannot answer.
     Bloom = 2,
+    /// A membership filter over the trigrams of the chunk's text values.
+    ///
+    /// Also not Arrow's. Pruning reads it to rule a segment out for a `LIKE`
+    /// whose search term holds a piece no value in the segment contains.
+    Trigram = 3,
 }
 
 /// One stored buffer.

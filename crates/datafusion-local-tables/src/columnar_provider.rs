@@ -20,7 +20,7 @@ use localtables_format::layout::manifest::SegmentEntry;
 
 use crate::columnar_exec::{to_df_error, ColumnarScanExec};
 use crate::dml::{compile_assignments, compile_predicate, ColumnarDataSink, DmlExec};
-use crate::pruning::{SegmentStatistics, SegmentZoneMaps};
+use crate::pruning::{substring_requirements, SegmentStatistics, SegmentZoneMaps};
 
 /// Exposes a [`ColumnarTable`] to DataFusion.
 #[derive(Debug, Clone)]
@@ -200,12 +200,21 @@ impl ColumnarTableProvider {
         bloom_columns.sort_unstable();
         bloom_columns.dedup();
 
+        // The LIKE predicates a trigram filter could act on. Read first,
+        // because it decides which trigram filters are worth loading, and they
+        // are the largest thing pruning reads.
+        let substrings = substring_requirements(filters, schema);
+        let mut trigram_columns: Vec<usize> = substrings.iter().map(|s| s.column).collect();
+        trigram_columns.sort_unstable();
+        trigram_columns.dedup();
+
         // Read every candidate's zone maps. This touches segment metadata
         // only, not column data.
         let mut zone_maps = Vec::with_capacity(candidates.len());
         for entry in candidates {
             let reader = self.table.segment_reader(entry).await.ok()?;
-            zone_maps.push(SegmentZoneMaps::from_reader(&reader, &bloom_columns).ok()?);
+            zone_maps
+                .push(SegmentZoneMaps::from_reader(&reader, &bloom_columns, &trigram_columns).ok()?);
         }
         let statistics = SegmentStatistics::new(schema.clone(), zone_maps);
 
@@ -230,6 +239,14 @@ impl ColumnarTableProvider {
             // is enough.
             for (slot, verdict) in keep.iter_mut().zip(verdicts) {
                 *slot &= verdict;
+            }
+        }
+
+        // Substring pruning, which DataFusion's predicate does not cover.
+        // Every requirement must hold, the same way the filters above combine.
+        for requirement in &substrings {
+            for (slot, segment) in keep.iter_mut().zip(statistics.segments()) {
+                *slot &= segment.may_match(requirement);
             }
         }
 

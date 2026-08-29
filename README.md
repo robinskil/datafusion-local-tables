@@ -24,10 +24,14 @@ GeoArrow geometries round-trip, four levels of nesting and extension metadata
 included. Zone maps stay type-specific: a type with no order this format can
 record simply prunes nothing.
 
-Equality is the case zone maps handle worst, because a column of scattered
-values leaves every segment's range covering the value being looked for. A
-column can opt into a membership filter, which rules out the segments that
-cannot hold a value at all.
+Zone maps prune by range, which leaves two cases they cannot help with. A column
+of scattered values has every segment's range covering the value being looked
+for, and a substring search is not a range at all. A column can opt into a
+membership filter for the first and a trigram filter for the second.
+
+Row order is a third lever. A zone map is selective on a column only when the
+rows follow that column's order, and only one column can have that; writing rows
+in z-order interleaves several columns so a segment covers a box in all of them.
 
 ## Layout
 
@@ -41,8 +45,9 @@ cannot hold a value at all.
 Under construction.
 
 The table works end to end: `SELECT`, `INSERT`, `DELETE` and `UPDATE` through
-SQL, with zone-map and membership-filter pruning, projection and limit
-pushdown, crash-safe commits, a write-ahead log, and compaction.
+SQL, with zone-map, membership-filter and trigram pruning, optional z-order
+clustering, projection and limit pushdown, crash-safe commits, a write-ahead
+log, and compaction.
 
 Three IO backends: mmap (default), positional reads, and io_uring on Linux.
 The io_uring backend compiles for Linux but has not been run. See

@@ -258,6 +258,66 @@ column and a literal in a predicate. A literal of a different type is cast
 first; one that cannot be cast, or that casts to null, is unknown rather than
 absent.
 
+## Trigram filters
+
+A membership filter holds whole values, so it says nothing about
+`col LIKE '%ell%'`. A trigram filter holds three-byte pieces of every value
+instead:
+
+```text
+'hello'  ->  'hel', 'ell', 'llo'
+```
+
+A search term is cut the same way, and every one of its pieces must be present
+for any row to contain it. One absent piece rules the segment out.
+
+Pieces are bytes rather than characters. UTF-8 is self-synchronising, so a valid
+sequence never starts part-way through another one, and byte containment and
+text containment agree.
+
+It cannot prove a match, only rule one out. A segment can hold `hel`, `ell` and
+`llo` in three different rows and hold `hello` nowhere, and every probe still
+passes. That is a second source of false positives on top of the filter's own,
+and no number of bits removes it. The scan's own filter decides the answer.
+
+### What it costs
+
+Filters are sized by *distinct* pieces, not by pieces produced. Text repeats its
+trigrams heavily, and a filter sized for every repeat would be many times larger
+for nothing, since inserting the same item twice adds no information. 100,000
+rows, whole-file sizes:
+
+| column | no filter | membership | trigram |
+| --- | --- | --- | --- |
+| small vocabulary | 3487 KiB | 3732 KiB | 3497 KiB |
+| high-entropy ids | 3577 KiB | 3817 KiB | 4137 KiB |
+
+Prose is close to free. Identifiers cost about a sixth of the file, because
+nearly every trigram of their alphabet appears.
+
+There are only 2^24 possible trigrams, and a column of near-random bytes
+approaches all of them: roughly 21 MiB of filter per chunk, ruling out almost
+nothing, since any search term's pieces are then present. A filter that would
+come out larger than the column it describes is not written at all.
+
+### What it declines to prune
+
+Each of these would drop segments holding matching rows, so each is refused:
+
+* `NOT LIKE`, which asks whether a value does *not* contain the term;
+* `ILIKE`, which matches text the filter never saw, since the filter holds the
+  bytes as written;
+* a pattern with an `ESCAPE`, where `%` and `_` are ordinary characters and
+  splitting on them would invent requirements;
+* either side of an `OR`, where a row can match through the other branch.
+
+Both sides of an `AND` are used, since both must hold. A pattern with no run of
+three bytes requires nothing and prunes nothing.
+
+DataFusion routes no `LIKE` to its pruning statistics, so this reads the filter
+expressions itself. Filters are pushed down as inexact, so the scan keeps a
+filter above it and an answer never depends on any of this being right.
+
 ## Deletes and compaction
 
 Segments never change once written, so a delete records row positions in a

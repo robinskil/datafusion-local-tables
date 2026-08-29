@@ -170,6 +170,53 @@ It is worth more than the others for that reason: `bloom_filter_on_read` is on
 by default in DataFusion, so parquet was reading its filters, and both files
 were written with matching row groups.
 
+## Substring search
+
+A zone map says nothing about what a value contains, so `LIKE` prunes nothing
+without a trigram filter. 500,000 rows in ten segments, one of which holds the
+term, all three built in one run:
+
+| variant | `body LIKE '%shard7 record%'` |
+| --- | --- |
+| local, no filter | 2.65 ms |
+| local, trigram filter | **996 µs** |
+| parquet | 4.12 ms |
+
+**A trigram filter is worth 2.7 times on this query.** Parquet is the reference
+for reading everything, since it has no substring index to switch on: this is
+not a like-for-like comparison the way the point lookup above is.
+
+The filter costs little on text and more on identifiers, because it is sized by
+distinct trigrams and prose repeats its own heavily. Whole-file sizes over
+100,000 rows: a small-vocabulary column grows 3487 to 3497 KiB, and a column of
+high-entropy ids grows 3577 to 4137 KiB. `docs/format.md` covers the bound that
+keeps a pathological column from writing a filter at all.
+
+## Clustered row order
+
+A 707 by 707 grid, written one row at a time, so the rows arrive ordered by `y`:
+
+| query | as written | z-ordered on `x`, `y` |
+| --- | --- | --- |
+| `x = 354` | 634 µs | **508 µs** |
+| `y = 354` | **538 µs** | 598 µs |
+| both | **694 µs** | 713 µs |
+
+**This is a trade and the timings show it as one.** `x` gains 20%, `y` loses
+11%, and querying both is a wash. Segment pruning moves much further than the
+clock does: for `x` it goes from 0 of 8 segments to 6 of 8. At half a million
+rows a segment is cheap enough that ruling out six of them saves only a fifth of
+the query.
+
+That gap is the useful part of this measurement. Clustering pays in proportion
+to what a segment costs to read, so it should matter more on wider rows, larger
+tables, and reads that miss the page cache. **None of those are measured here**,
+and this benchmark is a warm, memory-mapped, half-million-row table. Do not read
+the 20% as the number for a larger one in either direction.
+
+Clustering also costs write time, since the rows have to be reordered. That is
+not measured either.
+
 ## Parallel scans
 
 A segment is the unit a scan gives to a partition. Partitions take segments from

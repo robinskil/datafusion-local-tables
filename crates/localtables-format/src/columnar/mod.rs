@@ -9,6 +9,7 @@ pub mod memtable;
 pub mod page;
 pub mod segment;
 pub mod table;
+pub mod trigram;
 pub mod zonemap;
 pub mod zorder;
 

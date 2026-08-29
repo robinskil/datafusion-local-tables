@@ -126,6 +126,13 @@ pub struct TableOptions {
     pub cluster_by: Vec<String>,
     /// Which columns get a membership filter.
     pub bloom_filters: BloomFilters,
+    /// Which text columns get a trigram filter, for `LIKE` pruning.
+    ///
+    /// Holds three-byte pieces of every value rather than whole values, so a
+    /// substring search can rule out the segments that cannot contain it.
+    /// Larger than a membership filter, because one value contributes as many
+    /// pieces as it has characters. See `columnar::trigram`.
+    pub trigram_filters: BloomFilters,
     /// Bits a membership filter spends per value.
     ///
     /// More bits means fewer false positives and a larger filter. Ten gives
@@ -150,6 +157,7 @@ impl Default for TableOptions {
             rle_encoding: true,
             cluster_by: Vec::new(),
             bloom_filters: BloomFilters::default(),
+            trigram_filters: BloomFilters::default(),
             bloom_bits_per_value: crate::columnar::bloom::DEFAULT_BITS_PER_VALUE,
             read_only: false,
         }
@@ -204,6 +212,11 @@ impl TableOptions {
 
     pub fn with_bloom_filters(mut self, filters: BloomFilters) -> Self {
         self.bloom_filters = filters;
+        self
+    }
+
+    pub fn with_trigram_filters(mut self, filters: BloomFilters) -> Self {
+        self.trigram_filters = filters;
         self
     }
 }

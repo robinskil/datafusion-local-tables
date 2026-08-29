@@ -24,9 +24,11 @@ use arrow::array::{ArrayRef, BooleanArray, UInt64Array};
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::pruning::PruningStatistics;
 use datafusion::common::{Column, ScalarValue};
+use datafusion::logical_expr::{BinaryExpr, Expr, Like, Operator};
 
 use localtables_format::columnar::bloom::BloomFilter;
 use localtables_format::columnar::segment::SegmentReader;
+use localtables_format::columnar::trigram;
 use localtables_format::columnar::zonemap::ZoneMap;
 
 /// One segment's bounds for every column, read once when the scan is planned.
@@ -36,6 +38,8 @@ pub struct SegmentZoneMaps {
     pub columns: Vec<ZoneMap>,
     /// Membership filters, by column position. Empty when none were loaded.
     pub blooms: Vec<(usize, BloomFilter)>,
+    /// Trigram filters, by column position. Empty when none were loaded.
+    pub trigrams: Vec<(usize, BloomFilter)>,
     pub row_count: u64,
 }
 
@@ -50,6 +54,7 @@ impl SegmentZoneMaps {
     pub fn from_reader(
         reader: &SegmentReader,
         bloom_columns: &[usize],
+        trigram_columns: &[usize],
     ) -> localtables_format::Result<Self> {
         let meta = reader.meta()?;
         let columns: Vec<ZoneMap> = meta.columns.iter().map(|c| c.zone.to_native()).collect();
@@ -64,18 +69,123 @@ impl SegmentZoneMaps {
             }
         }
 
+        let mut trigrams = Vec::new();
+        for &index in trigram_columns {
+            if let Ok(Some(filter)) = reader.trigram_filter(index) {
+                trigrams.push((index, filter));
+            }
+        }
+
         Ok(Self {
             columns,
             blooms,
+            trigrams,
             row_count,
         })
     }
 
     fn bloom(&self, index: usize) -> Option<&BloomFilter> {
-        self.blooms
+        find(&self.blooms, index)
+    }
+
+    /// Whether this segment may hold a value matching a substring predicate.
+    ///
+    /// False only when the segment carries a trigram filter and that filter is
+    /// sure one of the required pieces is absent. No filter means no
+    /// information, which is `true`: read the segment.
+    pub fn may_match(&self, requirement: &SubstringRequirement) -> bool {
+        let Some(filter) = find(&self.trigrams, requirement.column) else {
+            return true;
+        };
+        requirement
+            .trigrams
             .iter()
-            .find(|(at, _)| *at == index)
-            .map(|(_, filter)| filter)
+            .all(|piece| filter.may_contain_hash(trigram::hash(piece)))
+    }
+}
+
+fn find(filters: &[(usize, BloomFilter)], index: usize) -> Option<&BloomFilter> {
+    filters
+        .iter()
+        .find(|(at, _)| *at == index)
+        .map(|(_, filter)| filter)
+}
+
+/// Pieces a `LIKE` predicate needs a segment to contain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubstringRequirement {
+    /// Position of the column in the table schema.
+    pub column: usize,
+    pub trigrams: Vec<[u8; trigram::SIZE]>,
+}
+
+/// Read the `LIKE` predicates a trigram filter can act on.
+///
+/// DataFusion's pruning does not route `LIKE` anywhere, so this reads the
+/// filter expressions itself. It is deliberately narrow, because every shape it
+/// accepts wrongly would prune a segment that holds matching rows:
+///
+/// * `NOT LIKE` says a value must *not* contain the term, which the filter
+///   cannot show;
+/// * `ILIKE` matches text the filter never saw, since the filter holds the
+///   bytes as they were written;
+/// * an escape character makes `%` and `_` ordinary, so splitting on them
+///   would invent pieces the pattern never required;
+/// * `OR` lets a row match through the other branch, so nothing either branch
+///   requires is required of the segment.
+///
+/// Anything else contributes no requirement, which prunes nothing.
+pub fn substring_requirements(filters: &[Expr], schema: &SchemaRef) -> Vec<SubstringRequirement> {
+    let mut found = Vec::new();
+    for filter in filters {
+        collect_substrings(filter, schema, &mut found);
+    }
+    found
+}
+
+fn collect_substrings(expr: &Expr, schema: &SchemaRef, found: &mut Vec<SubstringRequirement>) {
+    match expr {
+        // Both sides of an AND must hold, so both sides' requirements hold.
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::And,
+            right,
+        }) => {
+            collect_substrings(left, schema, found);
+            collect_substrings(right, schema, found);
+        }
+        Expr::Like(Like {
+            negated: false,
+            expr,
+            pattern,
+            escape_char: None,
+            case_insensitive: false,
+        }) => {
+            let Expr::Column(column) = expr.as_ref() else {
+                return;
+            };
+            let Expr::Literal(value, _) = pattern.as_ref() else {
+                return;
+            };
+            let pattern = match value {
+                ScalarValue::Utf8(Some(text))
+                | ScalarValue::LargeUtf8(Some(text))
+                | ScalarValue::Utf8View(Some(text)) => text,
+                _ => return,
+            };
+            let Ok(index) = schema.index_of(&column.name) else {
+                return;
+            };
+            let trigrams = trigram::required(pattern);
+            // A pattern with no run of three bytes says nothing usable.
+            if !trigrams.is_empty() {
+                found.push(SubstringRequirement {
+                    column: index,
+                    trigrams,
+                });
+            }
+        }
+        _ => {}
     }
 }
 
@@ -93,6 +203,10 @@ impl SegmentStatistics {
 
     pub fn is_empty(&self) -> bool {
         self.segments.is_empty()
+    }
+
+    pub fn segments(&self) -> &[SegmentZoneMaps] {
+        &self.segments
     }
 
     /// Position and type of a column, or `None` when the table has no such
@@ -231,6 +345,7 @@ mod tests {
         let row_count = ids.len() as u64;
         SegmentZoneMaps {
             blooms: Vec::new(),
+            trigrams: Vec::new(),
             columns: vec![
                 ZoneMap::build(&Int32Array::from(ids)),
                 ZoneMap::build(&StringArray::from(names)),

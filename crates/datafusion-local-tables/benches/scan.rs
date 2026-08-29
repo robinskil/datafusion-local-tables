@@ -669,6 +669,194 @@ fn scattered_point_lookup(c: &mut Criterion) {
     group.finish();
 }
 
+
+
+/// A query on a column the insert order does not follow.
+///
+/// Rows arrive ordered by `y`, so a zone map prunes `y` perfectly and `x` not
+/// at all. Clustering interleaves the two, which costs `y` some of its
+/// selectivity and gives `x` most of what it lacked.
+fn clustered_layout(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("x", DataType::Int64, false),
+        Field::new("y", DataType::Int64, false),
+        Field::new("payload", DataType::Int64, false),
+    ]));
+
+    // A 707 by 707 grid is close to ROWS, written one row of it at a time.
+    let side = 707i64;
+    let make_batch = |y: i64| {
+        let xs: Vec<i64> = (0..side).collect();
+        let ys = vec![y; side as usize];
+        let payload: Vec<i64> = xs.iter().map(|x| x * side + y).collect();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(xs)),
+                Arc::new(Int64Array::from(ys)),
+                Arc::new(Int64Array::from(payload)),
+            ],
+        )
+        .unwrap()
+    };
+
+    let build = |name: &'static str, cluster: Vec<String>| {
+        let schema = schema.clone();
+        let path = dir.path().join(format!("{name}.lt"));
+        runtime.block_on(async move {
+            let table = ColumnarTable::create(
+                &path,
+                schema,
+                TableOptions {
+                    durability: Durability::None,
+                    io_backend: IoBackend::Mmap,
+                    memtable_max_bytes: 256 * 1024 * 1024,
+                    cluster_by: cluster,
+                    ..TableOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            let batches: Vec<RecordBatch> = (0..side).map(make_batch).collect();
+            table.insert(&batches).await.unwrap();
+            table.flush().await.unwrap();
+            table
+        })
+    };
+
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+    ctx.register_table(
+        "plain",
+        Arc::new(ColumnarTableProvider::new(build("plain", Vec::new()))),
+    )
+    .unwrap();
+    ctx.register_table(
+        "clustered",
+        Arc::new(ColumnarTableProvider::new(build(
+            "clustered",
+            vec!["x".to_string(), "y".to_string()],
+        ))),
+    )
+    .unwrap();
+
+    for (name, predicate) in [
+        ("x only", "x = 354"),
+        ("y only", "y = 354"),
+        ("both", "x = 354 AND y = 354"),
+    ] {
+        let mut group = c.benchmark_group(format!("clustered scan ({name})"));
+        for table in ["plain", "clustered"] {
+            let sql = format!("SELECT count(*) FROM {table} WHERE {predicate}");
+            group.bench_function(table, |b| b.iter(|| run(&ctx, &runtime, &sql)));
+        }
+        group.finish();
+    }
+}
+
+/// A substring search over a text column.
+///
+/// Zone maps cannot prune this at all: a minimum and a maximum say nothing
+/// about what a value contains. Parquet has no substring index either, so it is
+/// here as the reference for what reading everything costs.
+fn substring_search(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("body", DataType::Utf8, false),
+    ]));
+
+    // Each segment gets a term of its own, so one segment holds the match and
+    // the rest hold text that merely looks similar.
+    let make_batch = |segment: i64| {
+        let ids: Vec<i64> = (0..ROWS_PER_SEGMENT)
+            .map(|r| segment * ROWS_PER_SEGMENT + r)
+            .collect();
+        let bodies: Vec<String> = ids
+            .iter()
+            .map(|i| format!("shard{segment} record{i} common filler text for padding"))
+            .collect();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(bodies)),
+            ],
+        )
+        .unwrap()
+    };
+    let all_batches = || (0..ROWS / ROWS_PER_SEGMENT).map(make_batch).collect::<Vec<_>>();
+
+    let build = |name: &'static str, filters: BloomFilters| {
+        let schema = schema.clone();
+        let path = dir.path().join(format!("{name}.lt"));
+        runtime.block_on(async move {
+            let table = ColumnarTable::create(
+                &path,
+                schema,
+                TableOptions {
+                    durability: Durability::None,
+                    io_backend: IoBackend::Mmap,
+                    memtable_max_bytes: 256 * 1024 * 1024,
+                    trigram_filters: filters,
+                    ..TableOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            for batch in all_batches() {
+                table.insert(&[batch]).await.unwrap();
+                table.flush().await.unwrap();
+            }
+            table
+        })
+    };
+
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+    ctx.register_table(
+        "no_filter",
+        Arc::new(ColumnarTableProvider::new(build("no_filter", BloomFilters::None))),
+    )
+    .unwrap();
+    ctx.register_table(
+        "filter",
+        Arc::new(ColumnarTableProvider::new(build(
+            "filter",
+            BloomFilters::Columns(vec!["body".to_string()]),
+        ))),
+    )
+    .unwrap();
+
+    let path = dir.path().join("substring.parquet");
+    let file = std::fs::File::create(&path).unwrap();
+    let properties = parquet::file::properties::WriterProperties::builder()
+        .set_max_row_group_row_count(Some(ROWS_PER_SEGMENT as usize))
+        .build();
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(properties)).unwrap();
+    for batch in all_batches() {
+        writer.write(&batch).unwrap();
+    }
+    writer.close().unwrap();
+    runtime
+        .block_on(ctx.register_parquet(
+            "pq",
+            path.to_str().unwrap(),
+            datafusion::prelude::ParquetReadOptions::default(),
+        ))
+        .unwrap();
+
+    let mut group = c.benchmark_group("substring search");
+    for table in ["no_filter", "filter", "pq"] {
+        let sql = format!("SELECT count(*) FROM {table} WHERE body LIKE '%shard7 record%'");
+        group.bench_function(table, |b| b.iter(|| run(&ctx, &runtime, &sql)));
+    }
+    group.finish();
+}
+
 /// How long it takes to make rows durable, one small insert at a time.
 ///
 /// This is what the write-ahead log exists for: a handful of rows should cost
@@ -721,6 +909,8 @@ criterion_group!(
     skewed_scan,
     parquet_view_types,
     scattered_point_lookup,
+    substring_search,
+    clustered_layout,
     small_writes
 );
 criterion_main!(benches);
