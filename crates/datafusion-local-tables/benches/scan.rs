@@ -545,11 +545,6 @@ fn scans(c: &mut Criterion) {
     }
 }
 
-/// How long it takes to make rows durable, one small insert at a time.
-///
-/// This is what the write-ahead log exists for: a handful of rows should cost
-/// one sync, not a segment write.
-
 /// Point lookups on a column whose values are scattered.
 ///
 /// The `scans` fixture uses an ordered id, which zone maps already prune down
@@ -674,6 +669,10 @@ fn scattered_point_lookup(c: &mut Criterion) {
     group.finish();
 }
 
+/// How long it takes to make rows durable, one small insert at a time.
+///
+/// This is what the write-ahead log exists for: a handful of rows should cost
+/// one sync, not a segment write.
 fn small_writes(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
