@@ -118,6 +118,33 @@ land in the log a flush is about to truncate.
 A damaged record hides every record after it, because their order is what makes
 them mean anything.
 
+## What a column can hold
+
+Any Arrow type. A column chunk stores what Arrow lays out — a null bitmap, the
+array's buffers in Arrow's order, and its child arrays — and hands them back the
+same way. Nothing in the encoder or decoder enumerates types, so nested types,
+dictionaries, and extension types all work without being named anywhere.
+
+Extension types need no special handling at all: an extension type is a storage
+type plus field metadata, the storage is an ordinary array, and the schema is
+stored as Arrow IPC, which preserves metadata. `tests/geoarrow_types.rs` covers
+this with GeoArrow geometries, whose multipolygons nest four levels deep.
+
+Two things are still type-specific, and deliberately:
+
+* **Zone maps** are built only for types with an order this format can record —
+  the numbers, strings, binary, and the date and time types. Everything else
+  reports no bound and prunes nothing, which costs a read and never loses a row.
+* **Dictionary and run-length encoding** are only *chosen* for the flat types
+  Arrow can cast, and only when they make the column smaller. A column the
+  schema already declares as a dictionary is stored that way and never expanded,
+  which is what lets a group by hash indices rather than values.
+
+A sliced array is compacted before it is stored, so a batch holding three rows
+of a million-row parent stores three rows. Whether an array needs compacting is
+decided by comparing the bytes its rows need against the bytes its buffers hold
+— a comparison Arrow can make for any type, so this is generic too.
+
 ## Deletes and compaction
 
 Segments never change once written, so a delete records row positions in a

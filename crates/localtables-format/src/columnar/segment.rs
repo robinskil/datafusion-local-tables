@@ -180,6 +180,7 @@ fn write_chunk(bytes: &mut Vec<u8>, encoded: EncodedColumn, codec: Codec) -> Res
         null_count: encoded.null_count,
         dict_len: encoded.dict_len,
         run_count: encoded.run_count,
+        offset: encoded.offset,
         buffers: specs,
         children,
         zone: encoded.zone,

@@ -211,6 +211,14 @@ fn bounds(array: &dyn Array) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
             )
         }
 
+        // A dictionary's bounds come from its values. Values the keys never
+        // reference widen the bounds rather than narrowing them, so the result
+        // still contains every value present, which is all a bound must do.
+        DataType::Dictionary(_, _) => {
+            let values = array.to_data().child_data()[0].clone();
+            bounds(arrow_array::make_array(values).as_ref())
+        }
+
         // Anything else prunes nothing rather than risking a wrong bound.
         _ => (None, None),
     }
@@ -281,6 +289,10 @@ fn decode_bound(bytes: &[u8], data_type: &DataType) -> Option<ArrayRef> {
             let value = std::str::from_utf8(bytes).ok()?;
             Some(Arc::new(arrow_array::LargeStringArray::from(vec![value])) as ArrayRef)
         }
+        // A dictionary's bounds are values, so they are read back as values.
+        // Pruning compares them against literals of the value type.
+        DataType::Dictionary(_, value_type) => decode_bound(bytes, value_type),
+
         DataType::Binary => Some(Arc::new(arrow_array::BinaryArray::from(vec![bytes])) as ArrayRef),
         DataType::LargeBinary => {
             Some(Arc::new(arrow_array::LargeBinaryArray::from(vec![bytes])) as ArrayRef)
@@ -421,6 +433,40 @@ mod tests {
         assert_eq!(increment_prefix(b"ab\xff"), Some(b"ac".to_vec()));
         assert_eq!(increment_prefix(b"\xff\xff"), None);
         assert_eq!(increment_prefix(b""), None);
+    }
+
+    #[test]
+    fn a_dictionary_column_is_bounded_by_its_values() {
+        let keys = Int32Array::from(vec![Some(0), Some(2), None, Some(1)]);
+        let values = Arc::new(StringArray::from(vec!["banana", "cherry", "apple"]));
+        let dict = arrow_array::DictionaryArray::<Int32Type>::try_new(keys, values).unwrap();
+
+        let zone = ZoneMap::build(&dict);
+        assert_eq!(zone.null_count, 1);
+
+        // Read back as the value type, which is what a predicate compares to.
+        let value_type = DataType::Utf8;
+        let min = zone.min_array(&value_type).unwrap();
+        let max = zone.max_array(&value_type).unwrap();
+        assert_eq!(min.as_string::<i32>().value(0), "apple");
+        assert_eq!(max.as_string::<i32>().value(0), "cherry");
+    }
+
+    #[test]
+    fn a_dictionary_bound_reads_back_through_its_own_type_too() {
+        let keys = Int32Array::from(vec![0, 1]);
+        let values = Arc::new(StringArray::from(vec!["a", "z"]));
+        let dict = arrow_array::DictionaryArray::<Int32Type>::try_new(keys, values).unwrap();
+
+        let zone = ZoneMap::build(&dict);
+        let declared = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let min = zone.min_array(&declared).unwrap();
+        assert_eq!(
+            min.data_type(),
+            &DataType::Utf8,
+            "a bound is a value, not an index into a dictionary"
+        );
+        assert_eq!(min.as_string::<i32>().value(0), "a");
     }
 
     #[test]

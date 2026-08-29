@@ -491,7 +491,7 @@ async fn a_damaged_column_buffer_is_caught_not_decoded() {
 
     // Flip a bit inside the values buffer.
     let values = built.meta.columns[0]
-        .buffer(localtables_format::columnar::BufferRole::Values)
+        .buffer(localtables_format::columnar::BufferRole::Data)
         .unwrap()
         .extent;
     let target = offset + values.offset + values.len / 2;
@@ -551,5 +551,299 @@ async fn a_truncated_segment_is_refused_rather_than_read() {
     assert!(
         matches!(err, localtables_format::Error::Corrupt(_)),
         "got {err:?}"
+    );
+}
+
+/// A dictionary column must come back as a dictionary, not expanded.
+///
+/// This is what lets a group by hash indices rather than values, which is the
+/// whole reason to declare the column that way.
+#[tokio::test]
+async fn a_dictionary_column_stays_a_dictionary() {
+    use arrow_array::types::Int32Type;
+    use arrow_array::DictionaryArray;
+
+    let data_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("category", data_type.clone(), true),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let keys = Int32Array::from(vec![Some(0), Some(1), None, Some(2), Some(0)]);
+    let values = Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"]));
+    let dict = DictionaryArray::<Int32Type>::try_new(keys, values).unwrap();
+
+    let original = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(dict),
+            Arc::new(Int64Array::from(vec![1i64, 2, 3, 4, 5])),
+        ],
+    )
+    .unwrap();
+
+    for compression in [Compression::None, Compression::Lz4] {
+        let opts = options(compression, true);
+        let (_dir, reader) = round_trip(&schema, std::slice::from_ref(&original), &opts).await;
+        let read = reader.read(None).unwrap();
+
+        assert_eq!(
+            read.column(0).data_type(),
+            &data_type,
+            "the column must keep the type the schema declares"
+        );
+        assert_eq!(read, original, "compression {compression:?}");
+
+        // The dictionary itself survives, not just the logical values.
+        let restored = read
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .expect("a dictionary column decodes to a dictionary array");
+        assert_eq!(restored.values().len(), 3, "the distinct values are intact");
+        assert!(restored.is_null(2));
+    }
+}
+
+/// A dictionary column stored uncompressed reads with no copy, like any other.
+#[tokio::test]
+async fn a_dictionary_column_reads_without_copying() {
+    use arrow_array::types::Int32Type;
+    use arrow_array::DictionaryArray;
+
+    let data_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+    let schema = Arc::new(Schema::new(vec![Field::new("c", data_type, false)]));
+
+    let keys = Int32Array::from((0..1000).map(|i| i % 4).collect::<Vec<i32>>());
+    let values = Arc::new(StringArray::from(vec!["w", "x", "y", "z"]));
+    let dict = DictionaryArray::<Int32Type>::try_new(keys, values).unwrap();
+    let original = RecordBatch::try_new(schema.clone(), vec![Arc::new(dict)]).unwrap();
+
+    let opts = options(Compression::None, false);
+    let (_dir, reader) = round_trip(&schema, std::slice::from_ref(&original), &opts).await;
+
+    let meta = reader.meta().unwrap();
+    assert!(
+        meta.columns[0].is_zero_copy(),
+        "a dictionary column is stored plainly, so it maps like any other"
+    );
+    assert_eq!(reader.read(None).unwrap(), original);
+}
+
+/// Nested and parameterised types round-trip, because the format stores what
+/// Arrow lays out rather than a list of types it knows about.
+#[tokio::test]
+async fn nested_and_exotic_types_round_trip() {
+    use arrow_array::builder::{ListBuilder, StringBuilder};
+    use arrow_array::types::Int32Type;
+    use arrow_array::{
+        Decimal128Array, DictionaryArray, DurationMicrosecondArray, FixedSizeBinaryArray,
+        IntervalMonthDayNanoArray, MapArray, StructArray, Time64NanosecondArray, UInt16Array,
+    };
+    use arrow_buffer::i256;
+
+    // A list of strings, with a null list and an empty one.
+    let mut lists = ListBuilder::new(StringBuilder::new());
+    lists.values().append_value("a");
+    lists.values().append_value("bb");
+    lists.append(true);
+    lists.append(false);
+    lists.append(true);
+    lists.values().append_null();
+    lists.values().append_value("c");
+    lists.append(true);
+    let list = lists.finish();
+
+    // A struct of two differently typed fields.
+    let struct_array = StructArray::from(vec![
+        (
+            Arc::new(Field::new("n", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![Some(1), None, Some(3), Some(4)])) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("s", DataType::Utf8, false)),
+            Arc::new(StringArray::from(vec!["w", "x", "y", "z"])) as ArrayRef,
+        ),
+    ]);
+
+    let dict = DictionaryArray::<Int32Type>::try_new(
+        Int32Array::from(vec![Some(0), Some(1), None, Some(0)]),
+        Arc::new(StringArray::from(vec!["red", "blue"])),
+    )
+    .unwrap();
+
+    let decimal = Decimal128Array::from(vec![Some(1234i128), None, Some(-9), Some(0)])
+        .with_precision_and_scale(10, 2)
+        .unwrap();
+
+    let decimal256 = arrow_array::Decimal256Array::from(vec![
+        Some(i256::from_i128(1)),
+        Some(i256::from_i128(-2)),
+        None,
+        Some(i256::MAX),
+    ])
+    .with_precision_and_scale(40, 4)
+    .unwrap();
+
+    let fixed = FixedSizeBinaryArray::try_from_iter(
+        vec![vec![1u8, 2, 3], vec![4, 5, 6], vec![7, 8, 9], vec![0, 0, 0]].into_iter(),
+    )
+    .unwrap();
+
+    // A map is a list of structs, so it exercises two levels of nesting.
+    let map = {
+        let keys = StringArray::from(vec!["k1", "k2", "k3"]);
+        let values = Int32Array::from(vec![10, 20, 30]);
+        let entries = StructArray::from(vec![
+            (
+                Arc::new(Field::new("keys", DataType::Utf8, false)),
+                Arc::new(keys) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("values", DataType::Int32, true)),
+                Arc::new(values) as ArrayRef,
+            ),
+        ]);
+        let offsets = arrow_buffer::OffsetBuffer::new(vec![0, 1, 1, 2, 3].into());
+        let field = Arc::new(Field::new("entries", entries.data_type().clone(), false));
+        MapArray::new(field, offsets, entries, None, false)
+    };
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("list", list.data_type().clone(), true),
+        Field::new("st", struct_array.data_type().clone(), false),
+        Field::new("dict", dict.data_type().clone(), true),
+        Field::new("dec", decimal.data_type().clone(), true),
+        Field::new("dec256", decimal256.data_type().clone(), true),
+        Field::new("fixed", fixed.data_type().clone(), false),
+        Field::new("map", map.data_type().clone(), false),
+        Field::new("u16", DataType::UInt16, true),
+        Field::new("dur", DataType::Duration(TimeUnit::Microsecond), true),
+        Field::new("time", DataType::Time64(TimeUnit::Nanosecond), true),
+        Field::new(
+            "interval",
+            DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano),
+            true,
+        ),
+    ]));
+
+    let original = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(list),
+            Arc::new(struct_array),
+            Arc::new(dict),
+            Arc::new(decimal),
+            Arc::new(decimal256),
+            Arc::new(fixed),
+            Arc::new(map),
+            Arc::new(UInt16Array::from(vec![Some(1), None, Some(65535), Some(0)])),
+            Arc::new(DurationMicrosecondArray::from(vec![
+                Some(1i64),
+                None,
+                Some(-1),
+                Some(i64::MAX),
+            ])),
+            Arc::new(Time64NanosecondArray::from(vec![
+                Some(0i64),
+                Some(1),
+                None,
+                Some(86_399_999_999_999),
+            ])),
+            Arc::new(IntervalMonthDayNanoArray::from(vec![
+                arrow_buffer::IntervalMonthDayNano::new(1, 2, 3),
+                arrow_buffer::IntervalMonthDayNano::new(0, 0, 0),
+                arrow_buffer::IntervalMonthDayNano::new(-1, -2, -3),
+                arrow_buffer::IntervalMonthDayNano::new(12, 30, 1_000),
+            ])),
+        ],
+    )
+    .unwrap();
+
+    for compression in [Compression::None, Compression::Lz4] {
+        let opts = options(compression, true);
+        let (_dir, reader) = round_trip(&schema, std::slice::from_ref(&original), &opts).await;
+        assert_eq!(
+            reader.read(None).unwrap(),
+            original,
+            "compression {compression:?}"
+        );
+    }
+}
+
+/// An extension type survives, because its identity lives in the schema's
+/// field metadata and its data is an ordinary array.
+#[tokio::test]
+async fn an_extension_type_keeps_its_metadata() {
+    use std::collections::HashMap;
+
+    let metadata = HashMap::from([
+        (
+            "ARROW:extension:name".to_string(),
+            "myorg.point".to_string(),
+        ),
+        (
+            "ARROW:extension:metadata".to_string(),
+            "{\"srid\":4326}".to_string(),
+        ),
+    ]);
+    let field =
+        Field::new("point", DataType::FixedSizeBinary(8), false).with_metadata(metadata.clone());
+    let schema = Arc::new(Schema::new(vec![field]));
+
+    let storage = arrow_array::FixedSizeBinaryArray::try_from_iter(
+        vec![vec![1u8; 8], vec![2u8; 8], vec![3u8; 8]].into_iter(),
+    )
+    .unwrap();
+    let original = RecordBatch::try_new(schema.clone(), vec![Arc::new(storage)]).unwrap();
+
+    let opts = options(Compression::None, false);
+    let (_dir, reader) = round_trip(&schema, std::slice::from_ref(&original), &opts).await;
+    let read = reader.read(None).unwrap();
+
+    assert_eq!(read, original);
+    assert_eq!(
+        read.schema().field(0).metadata(),
+        &metadata,
+        "an extension type is its storage plus its field metadata; both must survive"
+    );
+}
+
+/// A sliced batch stores only the rows it owns, whatever the types involved.
+#[tokio::test]
+async fn a_sliced_batch_does_not_store_its_parents_rows() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let text: Vec<String> = (0..10_000).map(|i| format!("value-number-{i}")).collect();
+    let whole = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from((0..10_000i64).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(text)),
+        ],
+    )
+    .unwrap();
+
+    let sliced = whole.slice(5_000, 3);
+    let opts = options(Compression::None, false);
+    let (_dir, reader) = round_trip(&schema, std::slice::from_ref(&sliced), &opts).await;
+
+    assert_eq!(reader.read(None).unwrap(), sliced);
+    let meta = reader.meta().unwrap();
+    let stored: u64 = meta
+        .columns
+        .iter()
+        .map(|c| {
+            c.buffers
+                .iter()
+                .map(|b| b.extent.len.to_native())
+                .sum::<u64>()
+        })
+        .sum();
+    assert!(
+        stored < 1_000,
+        "three rows should not carry ten thousand: stored {stored} bytes"
     );
 }

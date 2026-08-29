@@ -138,6 +138,112 @@ fn run(ctx: &SessionContext, runtime: &tokio::runtime::Runtime, sql: &str) -> us
     })
 }
 
+/// The same data with the string column declared as a dictionary.
+///
+/// This is the shape that lets a group by hash indices rather than values, and
+/// the point of measuring it is to see whether declaring it that way closes the
+/// gap against parquet.
+fn dict_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "category",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            false,
+        ),
+    ]))
+}
+
+fn dict_batch(ids: std::ops::Range<i64>) -> RecordBatch {
+    let ids: Vec<i64> = ids.collect();
+    let categories: Vec<String> = ids.iter().map(|i| format!("cat-{}", i % 8)).collect();
+    let plain = StringArray::from(categories);
+    let encoded = arrow::compute::cast(
+        &plain,
+        &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+    )
+    .unwrap();
+
+    RecordBatch::try_new(
+        dict_schema(),
+        vec![Arc::new(Int64Array::from(ids)), encoded],
+    )
+    .unwrap()
+}
+
+/// Group by a dictionary column, in both stores.
+fn dictionary_group_by(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    let ctx = runtime.block_on(async {
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+
+        let table = ColumnarTable::create(
+            &dir.path().join("dict.lt"),
+            dict_schema(),
+            TableOptions {
+                durability: Durability::None,
+                io_backend: IoBackend::Mmap,
+                memtable_max_bytes: 64 * 1024 * 1024,
+                // The column is already a dictionary; re-encoding it would only
+                // add a layer to undo.
+                dictionary_encoding: false,
+                rle_encoding: false,
+                ..TableOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let batches: Vec<RecordBatch> = (0..ROWS / ROWS_PER_SEGMENT)
+            .map(|segment| {
+                let start = segment * ROWS_PER_SEGMENT;
+                dict_batch(start..start + ROWS_PER_SEGMENT)
+            })
+            .collect();
+        for batch in &batches {
+            table.insert(std::slice::from_ref(batch)).await.unwrap();
+            table.flush().await.unwrap();
+        }
+        ctx.register_table("dict_local", Arc::new(ColumnarTableProvider::new(table)))
+            .unwrap();
+
+        let path = dir.path().join("dict.parquet");
+        let file = std::fs::File::create(&path).unwrap();
+        let properties = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(ROWS_PER_SEGMENT as usize))
+            .build();
+        let mut writer = ArrowWriter::try_new(file, dict_schema(), Some(properties)).unwrap();
+        for batch in &batches {
+            writer.write(batch).unwrap();
+        }
+        writer.close().unwrap();
+
+        ctx.register_parquet(
+            "dict_pq",
+            path.to_str().unwrap(),
+            datafusion::prelude::ParquetReadOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        ctx
+    });
+
+    let mut group = c.benchmark_group("group by (dictionary column)");
+    group.throughput(Throughput::Elements(ROWS as u64));
+    for table in ["dict_local", "dict_pq"] {
+        let sql = format!("SELECT category, count(*) FROM {table} GROUP BY category");
+        group.bench_function(table, |b| b.iter(|| run(&ctx, &runtime, &sql)));
+    }
+    group.finish();
+}
+
 fn scans(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -217,5 +323,5 @@ fn small_writes(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, scans, small_writes);
+criterion_group!(benches, scans, dictionary_group_by, small_writes);
 criterion_main!(benches);

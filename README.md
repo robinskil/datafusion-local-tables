@@ -17,6 +17,13 @@ archives and read in place. Column data is stored as raw Arrow buffers, so a
 scan can map a segment and build a `RecordBatch` over it without copying, and
 can decode one column without touching the others.
 
+A column can hold any Arrow type. The format stores what Arrow lays out — a
+null bitmap, the array's buffers, its child arrays — so nested types,
+dictionaries and extension types work without being enumerated anywhere.
+GeoArrow geometries round-trip, four levels of nesting and extension metadata
+included. Zone maps stay type-specific: a type with no order this format can
+record simply prunes nothing.
+
 ## Layout
 
 | crate | contents |

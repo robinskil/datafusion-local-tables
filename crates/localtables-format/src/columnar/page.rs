@@ -85,24 +85,23 @@ impl From<crate::config::Compression> for Codec {
 
 /// What a stored buffer means to the decoder.
 ///
-/// Arrow identifies buffers by position; naming them makes the format
-/// self-describing, so a damaged or unexpected chunk fails on a check rather
-/// than by handing Arrow the wrong bytes.
+/// A chunk holds the null bitmap, then Arrow's own buffers for the array in
+/// Arrow's own order. What each of those buffers means depends on the type —
+/// offsets for a string, values for an integer, indices for a dictionary — and
+/// the decoder does not need to know: it hands them back to Arrow in the same
+/// order, and Arrow's own validation decides whether they make sense.
+///
+/// That is what makes the format generic over the type stored. Naming the
+/// bitmap separately is still worth it, because it is the one buffer Arrow
+/// keeps outside `ArrayData::buffers`.
 #[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[rkyv(derive(Debug), compare(PartialEq))]
 #[repr(u8)]
 pub enum BufferRole {
     /// Null bitmap, one bit per row, starting at bit zero.
     Validity = 0,
-    /// Offsets into `Values`, for the variable-width types.
-    Offsets = 1,
-    /// The values themselves, or the bitmap for booleans.
-    Values = 2,
-    /// Dictionary indices, one per row. The distinct values are the chunk's
-    /// only child.
-    DictKeys = 3,
-    /// End position of each run. The run values are the chunk's only child.
-    RunEnds = 4,
+    /// One of Arrow's buffers for this array, in Arrow's order.
+    Data = 1,
 }
 
 /// One stored buffer.
@@ -141,10 +140,17 @@ pub struct ColumnChunk {
     /// Rows in the chunk. Always the segment's row count.
     pub len: u64,
     pub null_count: u64,
-    /// Distinct values, when the chunk is dictionary encoded.
+    /// Distinct values, when the chunk is dictionary encoded. Informational.
     pub dict_len: u64,
-    /// Runs, when the chunk is run-length encoded.
+    /// Runs, when the chunk is run-length encoded. Informational.
     pub run_count: u64,
+    /// Where this array's rows start inside its buffers.
+    ///
+    /// Normally zero: a sliced array is compacted before it is stored. It is
+    /// recorded anyway for the types Arrow cannot compact, where the parent's
+    /// buffers are stored as they stand and the offset is what makes them
+    /// readable.
+    pub offset: u64,
     pub buffers: Vec<BufferSpec>,
     /// Nested chunks. A dictionary chunk holds its distinct values here, a
     /// run-length chunk its run values. Plain chunks have none today; nested
@@ -157,6 +163,11 @@ pub struct ColumnChunk {
 impl ColumnChunk {
     pub fn buffer(&self, role: BufferRole) -> Option<&BufferSpec> {
         self.buffers.iter().find(|b| b.role == role)
+    }
+
+    /// Arrow's own buffers, in Arrow's order.
+    pub fn data_buffers(&self) -> impl Iterator<Item = &BufferSpec> {
+        self.buffers.iter().filter(|b| b.role == BufferRole::Data)
     }
 
     /// Bytes this chunk occupies on disk, children included.
@@ -188,6 +199,11 @@ impl ColumnChunk {
 impl ArchivedColumnChunk {
     pub fn buffer(&self, role: BufferRole) -> Option<&ArchivedBufferSpec> {
         self.buffers.iter().find(|b| b.role == role)
+    }
+
+    /// Arrow's own buffers, in Arrow's order.
+    pub fn data_buffers(&self) -> impl Iterator<Item = &ArchivedBufferSpec> {
+        self.buffers.iter().filter(|b| b.role == BufferRole::Data)
     }
 
     pub fn is_zero_copy(&self) -> bool {
@@ -241,9 +257,10 @@ mod tests {
             null_count: 3,
             dict_len: 0,
             run_count: 0,
+            offset: 0,
             buffers: vec![
                 spec(BufferRole::Validity, 0, 16),
-                spec(BufferRole::Values, 64, 800),
+                spec(BufferRole::Data, 64, 800),
             ],
             children: Vec::new(),
             zone: ZoneMap::unknown(3),
@@ -261,8 +278,8 @@ mod tests {
     #[test]
     fn buffers_are_found_by_role() {
         let chunk = chunk(Encoding::Plain, Codec::None);
-        assert_eq!(chunk.buffer(BufferRole::Values).unwrap().extent.len, 800);
-        assert!(chunk.buffer(BufferRole::Offsets).is_none());
+        assert_eq!(chunk.buffer(BufferRole::Data).unwrap().extent.len, 800);
+        assert_eq!(chunk.data_buffers().count(), 1);
         assert_eq!(chunk.stored_bytes(), 816);
         assert_eq!(chunk.extents().len(), 2);
     }
@@ -270,7 +287,7 @@ mod tests {
     #[test]
     fn a_chunk_accounts_for_its_children() {
         let mut parent = chunk(Encoding::Dictionary, Codec::None);
-        parent.buffers = vec![spec(BufferRole::DictKeys, 0, 400)];
+        parent.buffers = vec![spec(BufferRole::Data, 0, 400)];
         parent.children = vec![chunk(Encoding::Plain, Codec::None)];
 
         assert_eq!(parent.stored_bytes(), 400 + 816);
@@ -302,7 +319,7 @@ mod tests {
         assert!(!archived.columns[1].is_zero_copy());
         assert_eq!(
             archived.columns[0]
-                .buffer(BufferRole::Values)
+                .buffer(BufferRole::Data)
                 .unwrap()
                 .extent
                 .len

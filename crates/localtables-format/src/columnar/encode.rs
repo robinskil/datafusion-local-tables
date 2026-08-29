@@ -7,7 +7,7 @@
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int32Type;
-use arrow_array::{Array, ArrayRef};
+use arrow_array::{make_array, Array, ArrayRef};
 use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use crate::columnar::page::{BufferRole, Codec, Encoding};
 use crate::columnar::zonemap::ZoneMap;
 use crate::config::TableOptions;
-use crate::{Error, Result};
+use crate::Result;
 
 /// One column, encoded and ready to write.
 #[derive(Debug, Clone)]
@@ -27,6 +27,8 @@ pub struct EncodedColumn {
     pub dict_len: u64,
     /// Runs, when run-length encoded.
     pub run_count: u64,
+    /// Where the rows start inside the stored buffers. Normally zero.
+    pub offset: u64,
     pub zone: ZoneMap,
     /// Buffers in write order. Each is either a slice of the input array, which
     /// costs nothing, or a rebuilt buffer where the input could not be used as
@@ -69,11 +71,35 @@ pub fn encode_column(array: &dyn Array, options: &TableOptions) -> Result<Encode
     Ok(best)
 }
 
-/// Encode with Arrow's own layout, slicing rather than copying wherever the
-/// input array allows it.
+/// Encode an array exactly as Arrow lays it out.
+///
+/// This is generic over the type stored, and deliberately so. An Arrow array is
+/// a null bitmap, a list of buffers, and a list of child arrays; what those
+/// buffers mean is the type's business, not this function's. Storing that shape
+/// verbatim means every Arrow type works — nested types, dictionaries, and
+/// extension types, whose storage is an ordinary array and whose identity lives
+/// in the schema's field metadata.
+///
+/// Nothing is copied for an array that starts at row zero, which is the common
+/// case: the stored bytes are Arrow's own buffers.
 pub fn encode_plain(array: &dyn Array, zone: ZoneMap) -> Result<EncodedColumn> {
-    let len = array.len();
-    let offset = array.offset();
+    // A sliced array's buffers belong to its parent and carry rows this column
+    // does not own. Compacting rebuilds them around just these rows. Where
+    // Arrow cannot compact a type, the buffers are stored as they stand and the
+    // offset is recorded: larger, but still correct.
+    let compacted;
+    let array = if carries_only_its_own_rows(array) {
+        array
+    } else {
+        match compact(array) {
+            Some(rebuilt) => {
+                compacted = rebuilt;
+                compacted.as_ref()
+            }
+            None => array,
+        }
+    };
+
     let data = array.to_data();
     let mut buffers: Vec<(BufferRole, Buffer)> = Vec::new();
 
@@ -83,79 +109,74 @@ pub fn encode_plain(array: &dyn Array, zone: ZoneMap) -> Result<EncodedColumn> {
         // when the array was never offset.
         buffers.push((BufferRole::Validity, nulls.inner().sliced()));
     }
-
-    match array.data_type() {
-        DataType::Null => {}
-
-        DataType::Boolean => {
-            let values = array.as_boolean().values();
-            buffers.push((BufferRole::Values, values.sliced()));
-        }
-
-        DataType::Utf8 | DataType::Binary => {
-            push_var_width::<i32>(&data, offset, len, &mut buffers);
-        }
-        DataType::LargeUtf8 | DataType::LargeBinary => {
-            push_var_width::<i64>(&data, offset, len, &mut buffers);
-        }
-
-        other => {
-            let width = fixed_width(other).ok_or_else(|| {
-                Error::Unsupported(format!("{other} columns are not supported yet"))
-            })?;
-            let values = data.buffers()[0].slice_with_length(offset * width, len * width);
-            buffers.push((BufferRole::Values, values));
-        }
+    for buffer in data.buffers() {
+        buffers.push((BufferRole::Data, buffer.clone()));
     }
+
+    let children = data
+        .child_data()
+        .iter()
+        .map(|child| encode_plain(make_array(child.clone()).as_ref(), ZoneMap::unknown(0)))
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(EncodedColumn {
         encoding: Encoding::Plain,
-        len: len as u64,
+        len: array.len() as u64,
         null_count: array.null_count() as u64,
         dict_len: 0,
         run_count: 0,
+        offset: data.offset() as u64,
         zone,
         buffers,
-        children: Vec::new(),
+        children,
     })
 }
 
-/// Push the offsets and values of a variable-width column.
+/// True when this array's buffers hold its rows and nothing else.
 ///
-/// Offsets are stored based at zero, and values are trimmed to the range the
-/// offsets actually cover. An array that already satisfies both is sliced
-/// rather than rebuilt.
-fn push_var_width<O: arrow_array::OffsetSizeTrait>(
-    data: &arrow_data::ArrayData,
-    offset: usize,
-    len: usize,
-    buffers: &mut Vec<(BufferRole, Buffer)>,
-) {
-    let width = std::mem::size_of::<O>();
-    let all_offsets: &[O] = data.buffers()[0].typed_data::<O>();
-    let first = all_offsets[offset];
-    let last = all_offsets[offset + len];
-
-    let offsets = if first.is_zero() {
-        data.buffers()[0].slice_with_length(offset * width, (len + 1) * width)
-    } else {
-        // Rebase, so the values buffer can start at the first byte this column
-        // actually uses instead of carrying everything before it.
-        let rebased: Vec<O> = all_offsets[offset..=offset + len]
-            .iter()
-            .map(|o| *o - first)
-            .collect();
-        Buffer::from_vec(rebased)
+/// A slice can carry more than it owns in two ways: by leaving the buffers
+/// alone and setting an offset, or by narrowing one buffer and leaving another
+/// whole — which is what Arrow does when it slices a string column, and why
+/// checking the offset alone is not enough.
+///
+/// Arrow can say how many bytes the rows need, and that is compared against
+/// the bytes the buffers actually hold. For an array that owns its buffers the
+/// two are equal, for every type measured; a slice that carries its parent's
+/// values is where they diverge. Buffer *capacity* is deliberately not used:
+/// it is rounded up for alignment, which would make every array look wasteful.
+fn carries_only_its_own_rows(array: &dyn Array) -> bool {
+    if array.offset() != 0 {
+        return false;
+    }
+    let data = array.to_data();
+    let Ok(needed) = data.get_slice_memory_size() else {
+        // A type Arrow will not measure is stored as it stands.
+        return true;
     };
+    let held: usize = data.buffers().iter().map(|b| b.len()).sum::<usize>()
+        + data.nulls().map_or(0, |n| n.buffer().len())
+        + data
+            .child_data()
+            .iter()
+            .map(|child| child.get_slice_memory_size().unwrap_or(0))
+            .sum::<usize>();
+    held <= needed
+}
 
-    let values =
-        data.buffers()[1].slice_with_length(first.as_usize(), last.as_usize() - first.as_usize());
-
-    buffers.push((BufferRole::Offsets, offsets));
-    buffers.push((BufferRole::Values, values));
+/// Copy an array into fresh buffers holding only its own rows.
+///
+/// `concat` of a single array short-circuits to a slice, which is exactly what
+/// needs undoing, so an empty array of the same type goes in front to take the
+/// general path. Returns `None` for the types `concat` does not handle.
+fn compact(array: &dyn Array) -> Option<ArrayRef> {
+    let empty = arrow_array::new_empty_array(array.data_type());
+    arrow_select::concat::concat(&[empty.as_ref(), array]).ok()
 }
 
 /// Bytes per value for the fixed-width types this format stores.
+///
+/// Used to judge whether a re-encoding is worth trying, not to lay bytes out:
+/// the layout is Arrow's.
 pub fn fixed_width(data_type: &DataType) -> Option<usize> {
     use DataType::*;
     Some(match data_type {
@@ -184,8 +205,10 @@ pub fn fixed_width(data_type: &DataType) -> Option<usize> {
 
 /// True for types worth trying an alternative encoding on.
 ///
-/// Booleans are already one bit per row, and null columns store nothing, so
-/// neither can be improved on.
+/// Booleans are already one bit per row and null columns store nothing, so
+/// neither can be improved on. A column the schema already declares as a
+/// dictionary or a run-length encoding is left alone: it is stored in that form
+/// already, and wrapping it again would only add a layer to undo.
 fn worth_re_encoding(data_type: &DataType) -> bool {
     !matches!(data_type, DataType::Null | DataType::Boolean)
         && (fixed_width(data_type).is_some()
@@ -197,8 +220,8 @@ fn worth_re_encoding(data_type: &DataType) -> bool {
 
 /// Encode as distinct values plus one index per row.
 ///
-/// Returns `None` when the type is unsuitable, or when the encoded form cannot
-/// be stored in the shape this format expects.
+/// The re-encoded array is stored by the same generic path as any other; only
+/// the encoding tag differs, so the reader knows to cast it back.
 fn try_dictionary(array: &dyn Array, zone: &ZoneMap) -> Result<Option<EncodedColumn>> {
     if !worth_re_encoding(array.data_type()) || array.is_empty() {
         return Ok(None);
@@ -212,38 +235,21 @@ fn try_dictionary(array: &dyn Array, zone: &ZoneMap) -> Result<Option<EncodedCol
         return Ok(None);
     };
     let dict = encoded.as_dictionary::<Int32Type>();
-    let values: ArrayRef = dict.values().clone();
 
-    // A dictionary that is nearly as long as the column saves nothing and only
-    // adds an indirection on read.
-    if values.len() * 2 >= array.len() {
+    // A dictionary nearly as long as the column saves nothing and only adds an
+    // indirection on read.
+    if dict.values().len() * 2 >= array.len() {
         return Ok(None);
     }
 
-    let keys_plain = encode_plain(dict.keys(), ZoneMap::unknown(0))?;
-    let mut buffers = Vec::with_capacity(2);
-    for (role, buffer) in keys_plain.buffers {
-        buffers.push((
-            // The keys carry the column's nulls; their values become the index.
-            if role == BufferRole::Values {
-                BufferRole::DictKeys
-            } else {
-                role
-            },
-            buffer,
-        ));
-    }
-
-    Ok(Some(EncodedColumn {
-        encoding: Encoding::Dictionary,
-        len: array.len() as u64,
-        null_count: array.null_count() as u64,
-        dict_len: values.len() as u64,
-        run_count: 0,
-        zone: zone.clone(),
-        buffers,
-        children: vec![encode_plain(values.as_ref(), ZoneMap::unknown(0))?],
-    }))
+    let mut column = encode_plain(encoded.as_ref(), zone.clone())?;
+    column.encoding = Encoding::Dictionary;
+    column.dict_len = dict.values().len() as u64;
+    // The counts describe the column, not the form it happens to be stored in:
+    // a re-encoded array keeps its nulls somewhere else, and a reader asking
+    // how many rows are null means the column's rows.
+    column.null_count = array.null_count() as u64;
+    Ok(Some(column))
 }
 
 /// Encode as run ends plus one value per run.
@@ -259,33 +265,25 @@ fn try_run_length(array: &dyn Array, zone: &ZoneMap) -> Result<Option<EncodedCol
     let Ok(encoded) = arrow_cast::cast(array, &target) else {
         return Ok(None);
     };
-    let runs = encoded
+    let Some(runs) = encoded
         .as_any()
-        .downcast_ref::<arrow_array::RunArray<Int32Type>>();
-    let Some(runs) = runs else {
+        .downcast_ref::<arrow_array::RunArray<Int32Type>>()
+    else {
         return Ok(None);
     };
 
-    // `RunEndBuffer::len` is the logical row count; the runs themselves are in
-    // `values`.
-    let ends = runs.run_ends().values();
-    let run_count = ends.len();
+    // `RunEndBuffer::len` is the logical row count; the runs are in `values`.
+    let run_count = runs.run_ends().values().len();
     // One run per row means the column has no repetition to exploit.
     if run_count * 2 >= array.len() {
         return Ok(None);
     }
 
-    let run_ends = Buffer::from_slice_ref(ends);
-    Ok(Some(EncodedColumn {
-        encoding: Encoding::RunLength,
-        len: array.len() as u64,
-        null_count: array.null_count() as u64,
-        dict_len: 0,
-        run_count: run_count as u64,
-        zone: zone.clone(),
-        buffers: vec![(BufferRole::RunEnds, run_ends)],
-        children: vec![encode_plain(runs.values().as_ref(), ZoneMap::unknown(0))?],
-    }))
+    let mut column = encode_plain(encoded.as_ref(), zone.clone())?;
+    column.encoding = Encoding::RunLength;
+    column.run_count = run_count as u64;
+    column.null_count = array.null_count() as u64;
+    Ok(Some(column))
 }
 
 /// Apply `codec` to each buffer, keeping whichever form is smaller.
@@ -374,7 +372,7 @@ mod tests {
         let array = Int32Array::from(vec![1, 2, 3]);
         let column = encode_column(&array, &plain_options()).unwrap();
 
-        assert_eq!(roles(&column), vec![BufferRole::Values]);
+        assert_eq!(roles(&column), vec![BufferRole::Data]);
         assert_eq!(column.null_count, 0);
         assert_eq!(column.buffers[0].1.len(), 12);
     }
@@ -384,10 +382,7 @@ mod tests {
         let array = Int32Array::from(vec![Some(1), None, Some(3)]);
         let column = encode_column(&array, &plain_options()).unwrap();
 
-        assert_eq!(
-            roles(&column),
-            vec![BufferRole::Validity, BufferRole::Values]
-        );
+        assert_eq!(roles(&column), vec![BufferRole::Validity, BufferRole::Data]);
         assert_eq!(column.null_count, 1);
     }
 
@@ -420,27 +415,36 @@ mod tests {
         let array = StringArray::from(vec!["alpha", "beta", "gamma"]);
         let column = encode_column(&array, &plain_options()).unwrap();
 
-        assert_eq!(
-            roles(&column),
-            vec![BufferRole::Offsets, BufferRole::Values]
-        );
+        assert_eq!(roles(&column), vec![BufferRole::Data, BufferRole::Data]);
         let offsets = column.buffers[0].1.typed_data::<i32>();
         assert_eq!(offsets, &[0, 5, 9, 14]);
         assert_eq!(column.buffers[1].1.as_slice(), b"alphabetagamma");
     }
 
     #[test]
-    fn a_sliced_string_column_rebases_its_offsets_and_trims_its_values() {
+    fn a_sliced_string_column_stores_only_its_own_rows() {
         let array = StringArray::from(vec!["alpha", "beta", "gamma", "delta"]);
         let sliced = array.slice(1, 2);
         let column = encode_column(&sliced, &plain_options()).unwrap();
 
-        let offsets = column.buffers[0].1.typed_data::<i32>();
-        assert_eq!(offsets, &[0, 4, 9], "offsets must start at zero");
+        assert_eq!(column.offset, 0);
         assert_eq!(
             column.buffers[1].1.as_slice(),
             b"betagamma",
             "the values buffer must not carry rows this column does not hold"
+        );
+    }
+
+    #[test]
+    fn an_unsliced_column_is_stored_without_being_copied() {
+        let array = StringArray::from(vec!["alpha", "beta", "gamma"]);
+        let source = array.to_data().buffers()[1].clone();
+        let column = encode_column(&array, &plain_options()).unwrap();
+
+        assert_eq!(
+            column.buffers[1].1.as_ptr(),
+            source.as_ptr(),
+            "an array that owns its buffers must be stored straight from them"
         );
     }
 
@@ -508,7 +512,7 @@ mod tests {
     #[test]
     fn compression_keeps_whichever_form_is_smaller() {
         let repetitive = Buffer::from_vec(vec![7u8; 8192]);
-        let stored = compress_buffers(Codec::Lz4, &[(BufferRole::Values, repetitive)]).unwrap();
+        let stored = compress_buffers(Codec::Lz4, &[(BufferRole::Data, repetitive)]).unwrap();
         assert_eq!(stored[0].1.codec, Codec::Lz4);
         assert!(stored[0].1.len() < 8192);
         assert_eq!(stored[0].1.uncompressed_len, 8192);
@@ -522,11 +526,8 @@ mod tests {
                 state as u8
             })
             .collect();
-        let stored = compress_buffers(
-            Codec::Lz4,
-            &[(BufferRole::Values, Buffer::from_vec(random))],
-        )
-        .unwrap();
+        let stored =
+            compress_buffers(Codec::Lz4, &[(BufferRole::Data, Buffer::from_vec(random))]).unwrap();
         assert_eq!(
             stored[0].1.codec,
             Codec::None,
