@@ -28,9 +28,10 @@ can decode one column without touching the others.
 
 Under construction. The columnar table works end to end: `SELECT`, `INSERT`,
 `DELETE` and `UPDATE` through SQL, with zone-map pruning, projection and limit
-pushdown, crash-safe commits, a write-ahead log, and compaction. Still to come:
-the io_uring backend, the b-tree table, and nested Arrow types. See
-`docs/format.md` for the on-disk layout.
+pushdown, crash-safe commits, a write-ahead log, and compaction. Three IO
+backends: mmap (default), positional reads, and io_uring on Linux. Still to
+come: the b-tree table and nested Arrow types. See `docs/format.md` for the
+on-disk layout.
 
 ## Format stability
 

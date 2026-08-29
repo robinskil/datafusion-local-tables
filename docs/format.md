@@ -140,6 +140,24 @@ leave the old rows gone and the new ones missing.
 | Arrow buffers, frames | 64 bytes | widest SIMD register Arrow targets; also satisfies rkyv's 16 |
 | segment starts | 4096 bytes | a segment is mapped on its own |
 
+## IO backends
+
+| backend | reads | notes |
+| --- | --- | --- |
+| `mmap` (default) | map the segment, no syscall, no copy | Arrow buffers point into the page cache |
+| `pread` | positional reads on a blocking pool | portable; the reference the others are checked against |
+| `uring` | one submission per segment projection | Linux only, `uring` feature |
+
+The io_uring backend exists for one thing: a scan of a segment needs every
+projected column's byte ranges, which is one syscall each through `pread` and
+one submission for all of them through io_uring. Its ring is owned by a
+dedicated thread rather than integrated with tokio's driver, which keeps the
+unsafe part small. Writes go through positional writes in every backend,
+because the write path is sequential appends followed by a sync.
+
+Asking for a backend this build cannot provide is an error, never a silent
+downgrade to another one.
+
 ## Locking
 
 The writer takes an exclusive advisory lock on the data file; read-only handles

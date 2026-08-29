@@ -22,6 +22,9 @@ pub mod fault;
 #[cfg(feature = "mmap")]
 pub mod mmap;
 
+#[cfg(all(target_os = "linux", feature = "uring"))]
+pub mod uring;
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -110,10 +113,13 @@ pub fn open_backend(
             "the mmap backend needs the `mmap` feature".into(),
         )),
 
-        // The io_uring reactor lands in its own phase. Until then, asking for
-        // it is an error rather than a silent downgrade to another backend.
+        #[cfg(all(target_os = "linux", feature = "uring"))]
+        IoBackend::Uring => Ok(Arc::new(uring::UringIo::open(path, durability, read_only)?)),
+        // Asking for a backend this build cannot provide is an error, not a
+        // silent downgrade to another one.
+        #[cfg(not(all(target_os = "linux", feature = "uring")))]
         IoBackend::Uring => Err(Error::Unsupported(
-            "the io_uring backend is not implemented yet".into(),
+            "the io_uring backend needs Linux and the `uring` feature".into(),
         )),
     }
 }
