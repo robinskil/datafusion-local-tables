@@ -11,11 +11,12 @@
 
 use std::sync::{Arc, Weak};
 
+use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use parking_lot::Mutex;
 
 use crate::columnar::delete_vector::DeleteVector;
-use crate::layout::manifest::{Manifest, SegmentId};
+use crate::layout::manifest::{Manifest, SegmentEntry, SegmentId};
 
 /// The table as it stood at one commit.
 ///
@@ -27,10 +28,16 @@ pub struct Snapshot {
     pub txn_id: u64,
     pub schema: SchemaRef,
     pub manifest: Arc<Manifest>,
-    /// Deleted rows per segment, loaded once when the snapshot is published.
-    /// Segments with nothing deleted are absent rather than holding an empty
-    /// bitmap, so the common case costs no lookup.
+    /// Deleted rows per segment. Held in memory rather than read back per
+    /// snapshot, and more up to date than the counts in the manifest, because
+    /// a delete is durable in the log well before a flush records it in a
+    /// commit. Segments with nothing deleted are absent, so the common case
+    /// costs no lookup.
     pub deletes: Vec<(SegmentId, Arc<DeleteVector>)>,
+    /// Rows durable in the write-ahead log but not yet written to a segment.
+    /// A scan reads these alongside the segments, so a row is visible as soon
+    /// as its insert returns.
+    pub memtable: Arc<Vec<RecordBatch>>,
 }
 
 impl Snapshot {
@@ -41,14 +48,35 @@ impl Snapshot {
             .map(|(_, dv)| dv)
     }
 
+    /// Rows still readable in one segment.
+    pub fn live_rows_in(&self, entry: &SegmentEntry) -> u64 {
+        let deleted = self
+            .deletes_for(entry.segment_id)
+            .map_or(0, |dv| dv.len().min(entry.row_count));
+        entry.row_count - deleted
+    }
+
+    /// Rows held in memory but not yet in a segment.
+    pub fn memtable_rows(&self) -> u64 {
+        self.memtable.iter().map(|b| b.num_rows() as u64).sum()
+    }
+
     /// Rows a scan of this snapshot returns.
     pub fn live_rows(&self) -> u64 {
-        self.manifest.live_rows()
+        self.manifest
+            .segments
+            .iter()
+            .map(|entry| self.live_rows_in(entry))
+            .sum::<u64>()
+            + self.memtable_rows()
     }
 
     /// Segments with at least one row left to read.
-    pub fn live_segments(&self) -> impl Iterator<Item = &crate::layout::manifest::SegmentEntry> {
-        self.manifest.segments.iter().filter(|s| s.live_rows() > 0)
+    pub fn live_segments(&self) -> impl Iterator<Item = &SegmentEntry> {
+        self.manifest
+            .segments
+            .iter()
+            .filter(|entry| self.live_rows_in(entry) > 0)
     }
 }
 
@@ -119,6 +147,7 @@ mod tests {
             schema: Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
             manifest: Arc::new(Manifest::empty(crate::layout::DATA_START)),
             deletes: Vec::new(),
+            memtable: Arc::new(Vec::new()),
         })
     }
 
@@ -164,6 +193,7 @@ mod tests {
             schema: Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
             manifest: Arc::new(Manifest::empty(crate::layout::DATA_START)),
             deletes: Vec::new(),
+            memtable: Arc::new(Vec::new()),
         };
         snapshot
             .deletes

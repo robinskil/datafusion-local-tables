@@ -4,6 +4,7 @@ pub mod codec;
 pub mod decode;
 pub mod delete_vector;
 pub mod encode;
+pub mod memtable;
 pub mod page;
 pub mod segment;
 pub mod table;

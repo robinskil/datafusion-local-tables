@@ -100,6 +100,9 @@ async fn an_insert_is_all_or_nothing() {
                 .await
                 .unwrap();
             table.insert(&[batch(&[1, 2, 3])]).await.unwrap();
+            // Into a segment: these tests drive the file layer directly, so
+            // the starting state has to be in the file, not in the log.
+            table.flush().await.unwrap();
         }
 
         // Crash partway through a second insert.
@@ -185,6 +188,7 @@ async fn a_torn_delete_leaves_the_rows_in_place() {
                 .await
                 .unwrap();
             table.insert(&[batch(&[1, 2, 3, 4, 5])]).await.unwrap();
+            table.flush().await.unwrap();
         }
 
         {

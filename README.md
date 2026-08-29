@@ -26,8 +26,10 @@ can decode one column without touching the others.
 
 ## Status
 
-Under construction. Phase 1 (file format skeleton, IO backends, crash-safe
-commit protocol) has landed. See `docs/format.md` for the on-disk layout.
+Under construction. The storage engine is working: file format, IO backends,
+crash-safe commits, segments with encodings and zone maps, snapshots, delete
+vectors, and a write-ahead log with a memtable. The DataFusion providers and
+the b-tree table are next. See `docs/format.md` for the on-disk layout.
 
 ## Format stability
 

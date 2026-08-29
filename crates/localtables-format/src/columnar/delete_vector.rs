@@ -97,21 +97,33 @@ impl DeleteVector {
         arrow_array::BooleanArray::new(builder.finish(), None)
     }
 
-    /// Serialize into a frame ready to be written to the file.
-    pub fn to_frame(&self) -> Result<Vec<u8>> {
+    /// The bitmap on its own, with no frame around it.
+    ///
+    /// Used inside a log record, which already carries its own frame.
+    pub fn to_bitmap_bytes(&self) -> Result<Vec<u8>> {
         let mut payload = Vec::with_capacity(self.rows.serialized_size());
         self.rows
             .serialize_into(&mut payload)
             .map_err(|e| Error::corrupt(format!("delete vector failed to serialize: {e}")))?;
-        Ok(frame::encode(tag::DELETES, &payload))
+        Ok(payload)
+    }
+
+    /// Read back bytes written by [`DeleteVector::to_bitmap_bytes`].
+    pub fn from_bitmap_bytes(bytes: &[u8]) -> Result<Self> {
+        let rows = RoaringBitmap::deserialize_from(bytes)
+            .map_err(|e| Error::corrupt(format!("delete vector is malformed: {e}")))?;
+        Ok(Self { rows })
+    }
+
+    /// Serialize into a frame ready to be written to the file.
+    pub fn to_frame(&self) -> Result<Vec<u8>> {
+        Ok(frame::encode(tag::DELETES, &self.to_bitmap_bytes()?))
     }
 
     /// Read back a frame written by [`DeleteVector::to_frame`].
     pub fn from_frame(bytes: &[u8]) -> Result<Self> {
         let payload = frame::decode(bytes, tag::DELETES, "delete vector")?;
-        let rows = RoaringBitmap::deserialize_from(payload)
-            .map_err(|e| Error::corrupt(format!("delete vector is malformed: {e}")))?;
-        Ok(Self { rows })
+        Self::from_bitmap_bytes(payload)
     }
 }
 

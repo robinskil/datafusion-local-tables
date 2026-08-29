@@ -1,8 +1,8 @@
 # On-disk format
 
-One table lives in one file. A columnar table may keep two WAL sidecars while
-it holds unflushed writes; after a flush the sidecars are empty and the data
-file alone is a complete copy of the table.
+One table lives in one file, plus two write-ahead log sidecars named after it
+(`table.lt.wal0`, `table.lt.wal1`). After a flush both logs are empty and the
+data file alone is a complete copy of the table: copying it is a backup.
 
 ## File layout
 
@@ -68,6 +68,55 @@ Manifests are always placed at the end of the file, never in a reused extent.
 A manifest records the file length that includes itself, so it reserves a slot
 slightly larger than the record; the frame header carries the real payload
 length and the tail is padding.
+
+## Write-ahead log
+
+A small insert should not have to write a segment. It appends a record to the
+active log, waits for one sync, and lands in the memtable, where scans see it
+immediately. A flush turns the accumulated rows into one segment and empties
+the log.
+
+A log file is a 64-byte header followed by framed records:
+
+```
+[ header 64 bytes: magic, format version, generation, table uuid, checksum ]
+[ frame | frame | frame ... ]        each frame wraps one rkyv WalRecord
+```
+
+Three record shapes: `Insert`, `Delete`, `Update`. An update is one record, not
+a delete followed by an insert, because a crash between two records must never
+leave rows gone and their replacements missing.
+
+Batch payloads use a per-column rkyv record (`layout/batchcodec.rs`), not Arrow
+IPC. An IPC message has to be decoded whole before any one column can be read;
+here each column is separately addressable, so replay can decode or skip one
+column without touching the rest.
+
+Rows are addressed by sequence number, a counter that keeps rising across
+flushes. A logged delete names memtable rows by these, so it still finds the
+right rows after replay.
+
+### Why two logs
+
+A flush freezes the memtable and switches appends to the other log, so it can
+truncate the log it just made durable while new writes carry on. With one file,
+truncation would only be safe when nothing was being written — exactly when it
+is least needed. The higher generation number marks the active log, and both
+opening and recovering must use that same rule: if they disagree, an append can
+land in the log a flush is about to truncate.
+
+### Recovery
+
+1. Read the manifest, which carries `checkpoint_lsn`: every record at or below
+   it is already inside a segment.
+2. Read both logs in generation order. Check each frame; stop at the first that
+   fails and truncate the file back to the last good record. A torn tail is the
+   normal way a log ends after a crash, not an error.
+3. Replay records above the checkpoint, restoring the memtable and the
+   deletions at their original sequence numbers.
+
+A damaged record hides every record after it, because their order is what makes
+them mean anything.
 
 ## Alignment
 

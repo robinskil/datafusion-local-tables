@@ -19,6 +19,7 @@ pub mod io;
 pub mod layout;
 pub mod snapshot;
 pub mod table_file;
+pub mod wal;
 
 pub use columnar::ColumnarTable;
 pub use config::{Compression, Durability, IoBackend, TableOptions};

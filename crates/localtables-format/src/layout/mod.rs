@@ -1,5 +1,6 @@
 //! Shared on-disk primitives: magic numbers, alignment rules, byte extents.
 
+pub mod batchcodec;
 pub mod frame;
 pub mod header;
 pub mod manifest;

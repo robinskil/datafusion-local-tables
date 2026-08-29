@@ -156,6 +156,9 @@ async fn a_long_scan_is_unaffected_by_deletes_and_drops_behind_it() {
     for round in 0..8i32 {
         let rows: Vec<i32> = (round * 500..round * 500 + 500).collect();
         table.insert(&[batch(&rows)]).await.unwrap();
+        // One segment per round, so the writer below has segments to drop.
+        // An insert on its own only reaches the log and the memtable.
+        table.flush().await.unwrap();
     }
 
     // Pin, then let the writer delete everything the reader is holding.
@@ -179,6 +182,7 @@ async fn a_long_scan_is_unaffected_by_deletes_and_drops_behind_it() {
             for round in 100..110i32 {
                 let rows: Vec<i32> = (round * 500..round * 500 + 500).collect();
                 table.insert(&[batch(&rows)]).await.unwrap();
+                table.flush().await.unwrap();
             }
         })
     };
@@ -212,6 +216,9 @@ async fn arrow_buffers_outlive_the_snapshot_that_produced_them() {
         .insert(&[batch(&(0..2000).collect::<Vec<i32>>())])
         .await
         .unwrap();
+    // Into a segment, so the scan below maps the file. Rows still in the
+    // memtable are held in memory and would not test anything about mappings.
+    table.flush().await.unwrap();
 
     let batches = {
         let snapshot = table.snapshot();
@@ -228,6 +235,7 @@ async fn arrow_buffers_outlive_the_snapshot_that_produced_them() {
             )])
             .await
             .unwrap();
+        table.flush().await.unwrap();
     }
 
     assert_eq!(ids(&batches), (0..2000).collect::<Vec<i32>>());
