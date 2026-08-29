@@ -20,9 +20,12 @@ use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::{Schema, SchemaRef};
 use std::sync::Arc;
 
+use crate::columnar::bloom::BloomFilter;
 use crate::columnar::decode::{decode_column, BufferSource, SegmentBytes};
 use crate::columnar::encode::{compress_buffers, encode_column, EncodedColumn};
-use crate::columnar::page::{ArchivedSegmentMeta, BufferSpec, Codec, ColumnChunk, SegmentMeta};
+use crate::columnar::page::{
+    ArchivedSegmentMeta, BufferRole, BufferSpec, Codec, ColumnChunk, SegmentMeta,
+};
 use crate::config::TableOptions;
 use crate::io::buf::SharedBuf;
 use crate::layout::frame::{self, tag};
@@ -85,9 +88,16 @@ pub fn build_segment(
     let mut bytes: Vec<u8> = Vec::new();
     let mut chunks = Vec::with_capacity(columns.len());
 
-    for array in &columns {
+    for (index, array) in columns.iter().enumerate() {
         let encoded = encode_column(array.as_ref(), options)?;
-        chunks.push(write_chunk(&mut bytes, encoded, codec)?);
+        // Built here rather than inside the encoder, because whether a column
+        // gets a filter is a question about its name, not about its values.
+        let bloom = if options.bloom_filters.covers(schema.field(index).name()) {
+            BloomFilter::build(array.as_ref(), options.bloom_bits_per_value)?
+        } else {
+            None
+        };
+        chunks.push(write_chunk(&mut bytes, encoded, codec, bloom.as_ref())?);
     }
 
     let meta = SegmentMeta {
@@ -141,7 +151,12 @@ fn concat_columns(
 }
 
 /// Append one encoded column to the segment, padding each buffer.
-fn write_chunk(bytes: &mut Vec<u8>, encoded: EncodedColumn, codec: Codec) -> Result<ColumnChunk> {
+fn write_chunk(
+    bytes: &mut Vec<u8>,
+    encoded: EncodedColumn,
+    codec: Codec,
+    bloom: Option<&BloomFilter>,
+) -> Result<ColumnChunk> {
     let stored = compress_buffers(codec, &encoded.buffers)?;
 
     // A chunk is only zero-copy if every one of its buffers stayed raw. When
@@ -167,10 +182,25 @@ fn write_chunk(bytes: &mut Vec<u8>, encoded: EncodedColumn, codec: Codec) -> Res
         });
     }
 
+    // Stored raw and after the loop above, so it takes no part in the codec
+    // decision. A filter is close to random bits, which no codec shrinks.
+    if let Some(filter) = bloom {
+        pad_to_alignment(bytes);
+        let offset = bytes.len() as u64;
+        let stored = filter.to_bytes();
+        bytes.extend_from_slice(&stored);
+        specs.push(BufferSpec {
+            role: BufferRole::Bloom,
+            extent: Extent::new(offset, stored.len() as u64),
+            uncompressed_len: stored.len() as u64,
+            checksum: checksum(&stored),
+        });
+    }
+
     let children = encoded
         .children
         .into_iter()
-        .map(|child| write_chunk(bytes, child, codec))
+        .map(|child| write_chunk(bytes, child, codec, None))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(ColumnChunk {
@@ -271,6 +301,40 @@ impl SegmentReader {
 
     pub fn row_count(&self) -> Result<u64> {
         Ok(self.meta()?.row_count.to_native())
+    }
+
+    /// The membership filter for one column, when the segment stored one.
+    ///
+    /// Reads only the filter's bytes, not the column's. A segment written
+    /// before filters were asked for simply has none, and reports `None`.
+    pub fn bloom_filter(&self, index: usize) -> Result<Option<BloomFilter>> {
+        let meta = self.meta()?;
+        let Some(chunk) = meta.columns.get(index) else {
+            return Ok(None);
+        };
+        let Some(spec) = chunk.buffer(BufferRole::Bloom) else {
+            return Ok(None);
+        };
+
+        let start = spec.extent.offset.to_native() as usize;
+        let end = start
+            .checked_add(spec.extent.len.to_native() as usize)
+            .ok_or_else(|| Error::corrupt("a membership filter's extent overflows"))?;
+        let all = self.bytes.as_slice();
+        if end > all.len() {
+            return Err(Error::corrupt(format!(
+                "a membership filter at {start}..{end} runs past the {}-byte segment",
+                all.len()
+            )));
+        }
+
+        let stored = &all[start..end];
+        if checksum(stored) != spec.checksum.to_native() {
+            return Err(Error::corrupt(
+                "a membership filter failed its checksum".to_string(),
+            ));
+        }
+        BloomFilter::from_bytes(stored).map(Some)
     }
 
     pub fn schema(&self) -> &SchemaRef {

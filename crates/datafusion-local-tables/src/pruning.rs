@@ -5,6 +5,13 @@
 //! ones a predicate cannot match, and the scan skips those without reading a
 //! byte of their data.
 //!
+//! Equality is the case zone maps handle worst. On a column of scattered
+//! values every segment's range spans the value being looked for, so nothing is
+//! ruled out. Where a segment carries a membership filter, [`contained`] answers
+//! that case instead.
+//!
+//! [`contained`]: PruningStatistics::contained
+//!
 //! The interval reasoning is DataFusion's own. This file only reports what the
 //! zone maps know, and reports nothing where they do not know: a null entry
 //! means "no information", which costs a segment read, while a wrong entry
@@ -18,6 +25,7 @@ use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::pruning::PruningStatistics;
 use datafusion::common::{Column, ScalarValue};
 
+use localtables_format::columnar::bloom::BloomFilter;
 use localtables_format::columnar::segment::SegmentReader;
 use localtables_format::columnar::zonemap::ZoneMap;
 
@@ -26,17 +34,48 @@ use localtables_format::columnar::zonemap::ZoneMap;
 pub struct SegmentZoneMaps {
     /// One entry per column of the table schema.
     pub columns: Vec<ZoneMap>,
+    /// Membership filters, by column position. Empty when none were loaded.
+    pub blooms: Vec<(usize, BloomFilter)>,
     pub row_count: u64,
 }
 
 impl SegmentZoneMaps {
     /// Read the zone maps out of a segment's metadata.
-    pub fn from_reader(reader: &SegmentReader) -> localtables_format::Result<Self> {
+    ///
+    /// `bloom_columns` names the columns whose membership filter is worth
+    /// loading: a filter lives outside the metadata frame and is far larger
+    /// than one, so only the columns a predicate actually mentions are read.
+    /// A column with no filter, or a segment written before filters were asked
+    /// for, contributes nothing and prunes nothing.
+    pub fn from_reader(
+        reader: &SegmentReader,
+        bloom_columns: &[usize],
+    ) -> localtables_format::Result<Self> {
         let meta = reader.meta()?;
+        let columns: Vec<ZoneMap> = meta.columns.iter().map(|c| c.zone.to_native()).collect();
+        let row_count = meta.row_count.to_native();
+
+        let mut blooms = Vec::new();
+        for &index in bloom_columns {
+            // A damaged filter must not fail the scan: it is an optimisation,
+            // and the column's own bytes still carry the truth.
+            if let Ok(Some(filter)) = reader.bloom_filter(index) {
+                blooms.push((index, filter));
+            }
+        }
+
         Ok(Self {
-            columns: meta.columns.iter().map(|c| c.zone.to_native()).collect(),
-            row_count: meta.row_count.to_native(),
+            columns,
+            blooms,
+            row_count,
         })
+    }
+
+    fn bloom(&self, index: usize) -> Option<&BloomFilter> {
+        self.blooms
+            .iter()
+            .find(|(at, _)| *at == index)
+            .map(|(_, filter)| filter)
     }
 }
 
@@ -133,11 +172,44 @@ impl PruningStatistics for SegmentStatistics {
 
     /// Whether a segment holds only values from a given set.
     ///
-    /// Zone maps record a range, not a membership, so this never claims to
-    /// know. Answering it would need per-segment dictionaries or filters,
-    /// which the format does not keep.
-    fn contained(&self, _column: &Column, _values: &HashSet<ScalarValue>) -> Option<BooleanArray> {
-        None
+    /// A membership filter answers half of this question. It can show that a
+    /// segment holds *none* of the values, which is `false` and prunes the
+    /// segment; it can never show that a segment holds *only* them, which is
+    /// what `true` would mean, so `true` is never returned. Anything else is
+    /// null: unknown, read the segment.
+    ///
+    /// The filter admits false positives, so "may hold one of these" is not
+    /// evidence of anything and reports null. It admits no false negatives,
+    /// which is what makes `false` safe to act on.
+    fn contained(&self, column: &Column, values: &HashSet<ScalarValue>) -> Option<BooleanArray> {
+        let (index, data_type) = self.column(column)?;
+        if values.is_empty() || self.segments.iter().all(|s| s.bloom(index).is_none()) {
+            return None;
+        }
+
+        // Each literal becomes a one-row array once, not once per segment.
+        let mut probes = Vec::with_capacity(values.len());
+        for value in values {
+            probes.push(value.to_array().ok()?);
+        }
+
+        let mut any_known = false;
+        let mut verdicts = Vec::with_capacity(self.segments.len());
+        for segment in &self.segments {
+            let verdict = match segment.bloom(index) {
+                Some(filter) if !probes.iter().any(|p| filter.may_contain(p, data_type)) => {
+                    any_known = true;
+                    Some(false)
+                }
+                _ => None,
+            };
+            verdicts.push(verdict);
+        }
+
+        if !any_known {
+            return None;
+        }
+        Some(BooleanArray::from(verdicts))
     }
 }
 
@@ -158,6 +230,7 @@ mod tests {
     fn segment(ids: Vec<Option<i32>>, names: Vec<Option<&str>>) -> SegmentZoneMaps {
         let row_count = ids.len() as u64;
         SegmentZoneMaps {
+            blooms: Vec::new(),
             columns: vec![
                 ZoneMap::build(&Int32Array::from(ids)),
                 ZoneMap::build(&StringArray::from(names)),

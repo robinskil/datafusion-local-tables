@@ -102,6 +102,11 @@ pub enum BufferRole {
     Validity = 0,
     /// One of Arrow's buffers for this array, in Arrow's order.
     Data = 1,
+    /// A membership filter over the chunk's non-null values.
+    ///
+    /// Not Arrow's; the decoder skips it. Pruning reads it to rule a segment
+    /// out for an equality the zone map cannot answer.
+    Bloom = 2,
 }
 
 /// One stored buffer.

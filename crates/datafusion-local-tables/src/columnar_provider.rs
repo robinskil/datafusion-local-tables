@@ -189,12 +189,23 @@ impl ColumnarTableProvider {
             return None;
         }
 
+        // Columns the filters mention. A membership filter is far larger than
+        // a zone map and lives outside the metadata frame, so only these are
+        // read; a filter on a column nobody asked about would prune nothing.
+        let mut bloom_columns: Vec<usize> = filters
+            .iter()
+            .flat_map(|filter| filter.column_refs())
+            .filter_map(|column| schema.index_of(&column.name).ok())
+            .collect();
+        bloom_columns.sort_unstable();
+        bloom_columns.dedup();
+
         // Read every candidate's zone maps. This touches segment metadata
         // only, not column data.
         let mut zone_maps = Vec::with_capacity(candidates.len());
         for entry in candidates {
             let reader = self.table.segment_reader(entry).await.ok()?;
-            zone_maps.push(SegmentZoneMaps::from_reader(&reader).ok()?);
+            zone_maps.push(SegmentZoneMaps::from_reader(&reader, &bloom_columns).ok()?);
         }
         let statistics = SegmentStatistics::new(schema.clone(), zone_maps);
 

@@ -38,6 +38,43 @@ pub enum IoBackend {
     Uring,
 }
 
+/// Which columns get a membership filter.
+///
+/// A filter answers `col = x` where a zone map cannot: on a column of scattered
+/// values every segment's range spans the value, so no segment is ruled out and
+/// the scan reads all of them. It costs
+/// [`TableOptions::bloom_bits_per_value`] bits for every non-null value, so it
+/// is off by default and asked for per column, the way parquet asks.
+///
+/// It pays on a column that is looked up by equality and has many distinct
+/// values. It does not pay on a low-cardinality column, where a zone map or a
+/// dictionary already answers, nor on one only ever compared by range.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum BloomFilters {
+    /// No filters. Equality falls back to zone maps.
+    #[default]
+    None,
+    /// Every column whose type has a canonical byte form.
+    All,
+    /// The named columns, where their type allows it.
+    Columns(Vec<String>),
+}
+
+impl BloomFilters {
+    /// True when this column should get a filter.
+    pub fn covers(&self, column: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::All => true,
+            Self::Columns(names) => names.iter().any(|name| name == column),
+        }
+    }
+
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
 /// Per-page compression codec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Compression {
@@ -76,6 +113,13 @@ pub struct TableOptions {
     pub dictionary_encoding: bool,
     /// Try run-length encoding when a column chunk has long runs.
     pub rle_encoding: bool,
+    /// Which columns get a membership filter.
+    pub bloom_filters: BloomFilters,
+    /// Bits a membership filter spends per value.
+    ///
+    /// More bits means fewer false positives and a larger filter. Ten gives
+    /// roughly one in a hundred, which costs a segment read and never a row.
+    pub bloom_bits_per_value: usize,
     /// Open read-only. Skips the writer lock, permits many processes.
     pub read_only: bool,
 }
@@ -93,6 +137,8 @@ impl Default for TableOptions {
             compression: Compression::default(),
             dictionary_encoding: true,
             rle_encoding: true,
+            bloom_filters: BloomFilters::default(),
+            bloom_bits_per_value: crate::columnar::bloom::DEFAULT_BITS_PER_VALUE,
             read_only: false,
         }
     }
@@ -132,6 +178,11 @@ impl TableOptions {
 
     pub fn with_compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
+        self
+    }
+
+    pub fn with_bloom_filters(mut self, filters: BloomFilters) -> Self {
+        self.bloom_filters = filters;
         self
     }
 }
@@ -199,6 +250,26 @@ mod tests {
             ..TableOptions::default()
         };
         assert_eq!(options.row_group_size_for(1_000_000), 0);
+    }
+
+    #[test]
+    fn filters_are_off_until_they_are_asked_for() {
+        assert!(TableOptions::default().bloom_filters.is_none());
+        assert!(!TableOptions::default().bloom_filters.covers("id"));
+    }
+
+    #[test]
+    fn named_columns_get_filters_and_others_do_not() {
+        let filters = BloomFilters::Columns(vec!["id".to_string(), "email".to_string()]);
+        assert!(filters.covers("id"));
+        assert!(filters.covers("email"));
+        assert!(!filters.covers("name"));
+        assert!(!filters.covers("i"));
+    }
+
+    #[test]
+    fn asking_for_all_covers_every_name() {
+        assert!(BloomFilters::All.covers("anything at all"));
     }
 
     #[test]
