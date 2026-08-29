@@ -182,6 +182,38 @@ a partial one, compaction leaves uneven ones, a compressed segment costs more to
 decode than a mapped one — so a split decided before any of them is read is
 guessing.
 
+## Clustered row order
+
+A zone map prunes a column well when the rows are written in that column's
+order. Only one column can have that. Sort by `ts` and a segment covers a minute
+of time and the whole range of everything else.
+
+A z-order interleaves the leading bits of several columns into one sort key, so
+a segment covers a compact box in all of them instead of a narrow slice of one.
+Rows are reordered before they are cut into row groups, at flush and at
+compaction alike.
+
+A 128 by 128 grid written one row at a time, in eight segments:
+
+| pruned by | written as it arrives | z-ordered on `x`, `y` |
+| --- | --- | --- |
+| `x = 64` | 0 of 8 | 6 of 8 |
+| `y = 64` | 7 of 8 | 4 of 8 |
+
+That is the whole trade. `y` gets worse, because the insert order already
+followed it perfectly. `x` goes from unprunable to mostly pruned. A query that
+touches either column, or both, reads less.
+
+This is a layout and not an index. It stores no extra bytes, and zone maps are
+still built from the values actually written, so a poor key costs reads and
+never rows. The key is free to approximate for that reason: each column
+contributes eight bytes of its order-preserving encoding, and nulls sort to one
+end.
+
+Clustering costs write time, because the rows have to be reordered and that
+copies them. Groups come back already gathered, so it is one copy rather than
+the two that reordering and then slicing would take.
+
 ## Membership filters
 
 A zone map prunes `col = x` only when `x` sits outside a segment's minimum and

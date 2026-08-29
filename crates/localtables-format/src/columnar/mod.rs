@@ -10,6 +10,7 @@ pub mod page;
 pub mod segment;
 pub mod table;
 pub mod zonemap;
+pub mod zorder;
 
 pub use bloom::BloomFilter;
 pub use delete_vector::DeleteVector;

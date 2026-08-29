@@ -113,6 +113,17 @@ pub struct TableOptions {
     pub dictionary_encoding: bool,
     /// Try run-length encoding when a column chunk has long runs.
     pub rle_encoding: bool,
+    /// Columns whose bits are interleaved to order rows before they are
+    /// written.
+    ///
+    /// Empty means rows keep the order they arrived in, which makes zone maps
+    /// selective on whatever column that order follows and on nothing else. A
+    /// z-order makes them selective on all of these at once, and none of them
+    /// as well as a plain sort would. See `columnar::zorder`.
+    ///
+    /// This is a layout, not an index: it stores no extra bytes and cannot
+    /// affect what a query returns.
+    pub cluster_by: Vec<String>,
     /// Which columns get a membership filter.
     pub bloom_filters: BloomFilters,
     /// Bits a membership filter spends per value.
@@ -137,6 +148,7 @@ impl Default for TableOptions {
             compression: Compression::default(),
             dictionary_encoding: true,
             rle_encoding: true,
+            cluster_by: Vec::new(),
             bloom_filters: BloomFilters::default(),
             bloom_bits_per_value: crate::columnar::bloom::DEFAULT_BITS_PER_VALUE,
             read_only: false,
@@ -178,6 +190,15 @@ impl TableOptions {
 
     pub fn with_compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
+        self
+    }
+
+    pub fn with_cluster_by<I, S>(mut self, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.cluster_by = columns.into_iter().map(Into::into).collect();
         self
     }
 

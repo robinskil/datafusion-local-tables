@@ -23,6 +23,7 @@ use tokio::sync::Mutex;
 use crate::columnar::delete_vector::DeleteVector;
 use crate::columnar::memtable::Memtable;
 use crate::columnar::segment::{build_segment, SegmentReader};
+use crate::columnar::zorder;
 use crate::config::TableOptions;
 use crate::io::FileIo;
 use crate::layout::manifest::{Manifest, SegmentEntry, SegmentId};
@@ -87,6 +88,9 @@ struct Inner {
     schema: SchemaRef,
     schema_fingerprint: u64,
     options: TableOptions,
+    /// Columns whose bits order the rows a flush writes, already resolved to
+    /// positions and checked against the schema.
+    cluster_columns: Vec<usize>,
 }
 
 /// A table stored in one local file, read column at a time.
@@ -121,6 +125,9 @@ impl ColumnarTable {
     async fn from_file(file: TableFile) -> Result<Self> {
         let schema = file.schema().clone();
         let schema_fingerprint = schema_codec::fingerprint(&schema);
+        // Checked here rather than at flush, so a name that is wrong is an
+        // error the caller sees before the table has accepted a single row.
+        let cluster_columns = zorder::resolve(&schema, &file.options().cluster_by)?;
         let io = file.io().clone();
         let options = file.options().clone();
         let path = file.path().to_path_buf();
@@ -166,6 +173,7 @@ impl ColumnarTable {
                 schema,
                 schema_fingerprint,
                 options,
+                cluster_columns,
             }),
         };
 
@@ -449,7 +457,7 @@ impl ColumnarTable {
         // large one gets groups near the cap rather than thousands of tiny ones.
         let total_rows = manifest.total_rows() + frozen.rows;
         let group_rows = self.inner.options.row_group_size_for(total_rows);
-        for group in split_row_groups(frozen.batches, group_rows) {
+        for group in self.row_groups(frozen.batches, group_rows)? {
             self.write_segment(&writer.file, &mut manifest, &group, min_active)
                 .await?;
         }
@@ -492,6 +500,28 @@ impl ColumnarTable {
     }
 
     /// Build one segment from these batches and record it in the manifest.
+    /// Cut batches into the row groups a flush or a compaction will write.
+    ///
+    /// With clustering off this keeps batches whole wherever they fit, so an
+    /// unsliced batch goes straight to disk from Arrow's own buffers. With it
+    /// on the rows have to be reordered, which copies them once; the groups
+    /// come back already gathered, so the copy happens once rather than twice.
+    fn row_groups(
+        &self,
+        batches: Vec<RecordBatch>,
+        group_rows: usize,
+    ) -> Result<Vec<Vec<RecordBatch>>> {
+        if self.inner.cluster_columns.is_empty() {
+            return Ok(split_row_groups(batches, group_rows));
+        }
+        zorder::cluster(
+            &batches,
+            &self.inner.schema,
+            &self.inner.cluster_columns,
+            group_rows,
+        )
+    }
+
     async fn write_segment(
         &self,
         file: &TableFile,
@@ -678,7 +708,7 @@ impl ColumnarTable {
             .inner
             .options
             .row_group_size_for(manifest.total_rows().max(rows));
-        for group in split_row_groups(live, group_rows) {
+        for group in self.row_groups(live, group_rows)? {
             self.write_segment(&writer.file, &mut manifest, &group, min_active)
                 .await?;
         }
