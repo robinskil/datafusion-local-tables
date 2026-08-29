@@ -40,6 +40,7 @@ io-uring = "0.7"
 
 proptest = "1"
 criterion = "0.5"
+parquet = "59.2"
 tempfile = "3"
 
 [profile.release]
@@ -47,5 +48,10 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 
+# Benchmarks are optimised but not link-time optimised: LTO across DataFusion
+# needs more memory than a laptop has, and both sides of every comparison are
+# built the same way, so what is measured is unaffected.
 [profile.bench]
 debug = true
+lto = false
+codegen-units = 16

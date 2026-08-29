@@ -22,6 +22,7 @@ pub mod snapshot;
 pub mod table_file;
 pub mod wal;
 
+pub use btree::{BTreeSnapshot, BTreeTable};
 pub use columnar::ColumnarTable;
 pub use config::{Compression, Durability, IoBackend, TableOptions};
 pub use error::{Error, Result};

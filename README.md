@@ -49,25 +49,44 @@ use datafusion_local_tables::{BTreeTableProvider, ColumnarTableProvider};
 use localtables_format::{BTreeTable, ColumnarTable, TableOptions};
 use std::sync::Arc;
 
-# async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let ctx = SessionContext::new();
+async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = SessionContext::new();
 
-let events = ColumnarTable::open("events.lt".as_ref(), TableOptions::default()).await?;
-ctx.register_table("events", Arc::new(ColumnarTableProvider::new(events)))?;
+    let events = ColumnarTable::open("events.lt".as_ref(), TableOptions::default()).await?;
+    ctx.register_table("events", Arc::new(ColumnarTableProvider::new(events)))?;
 
-let users = BTreeTable::open("users.ltb".as_ref(), &["id"], TableOptions::default()).await?;
-ctx.register_table("users", Arc::new(BTreeTableProvider::new(users)))?;
+    let users = BTreeTable::open("users.ltb".as_ref(), &["id"], TableOptions::default()).await?;
+    ctx.register_table("users", Arc::new(BTreeTableProvider::new(users)))?;
 
-// Prunes segments by zone map; seeks the b-tree by key.
-ctx.sql("SELECT u.name, count(*) FROM events e \
+    // Prunes segments by zone map; seeks the b-tree by key.
+    ctx.sql(
+        "SELECT u.name, count(*) FROM events e \
          JOIN users u ON e.user_id = u.id \
-         WHERE e.ts > 1700000000 GROUP BY u.name")
-   .await?
-   .show()
-   .await?;
-# Ok(())
-# }
+         WHERE e.ts > 1700000000 GROUP BY u.name",
+    )
+    .await?
+    .show()
+    .await?;
+
+    Ok(())
+}
 ```
+
+## Benchmarks
+
+```bash
+cargo bench -p datafusion-local-tables
+```
+
+Runs the same queries against a local table and an equivalent parquet file
+through the same DataFusion session, so what is measured is the storage layer
+rather than the query engine.
+
+Scans come out about twice as fast as parquet, which is the zero-copy read path
+doing what it exists for. Group-by on a low-cardinality string column is slower,
+because parquet's reader hands DataFusion a dictionary array and this crate
+hands it expanded strings. See `docs/performance.md` for the numbers and what
+they mean.
 
 ## Format stability
 
