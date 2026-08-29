@@ -18,7 +18,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use parquet::arrow::ArrowWriter;
 
 use datafusion_local_tables::ColumnarTableProvider;
-use localtables_format::{ColumnarTable, Durability, IoBackend, TableOptions};
+use localtables_format::{BloomFilters, ColumnarTable, Durability, IoBackend, TableOptions};
 
 const ROWS: i64 = 500_000;
 const ROWS_PER_SEGMENT: i64 = 50_000;
@@ -549,6 +549,131 @@ fn scans(c: &mut Criterion) {
 ///
 /// This is what the write-ahead log exists for: a handful of rows should cost
 /// one sync, not a segment write.
+
+/// Point lookups on a column whose values are scattered.
+///
+/// The `scans` fixture uses an ordered id, which zone maps already prune down
+/// to one segment, so a membership filter has nothing left to do there. This
+/// one writes a permutation of the same range instead: every segment holds keys
+/// from across the whole table, every segment's minimum and maximum span it,
+/// and no range test rules any of them out. It is the case membership filters
+/// exist for, measured against parquet with its own filters switched on.
+fn scattered_point_lookup(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Int64, false),
+        Field::new("value", DataType::Float64, false),
+        Field::new("payload", DataType::Int64, false),
+    ]));
+
+    // Knuth's multiplier shares no factor with ROWS, so this is a permutation:
+    // every key in 0..ROWS appears exactly once, in scattered order.
+    let scattered = |i: i64| i.wrapping_mul(2_654_435_761).rem_euclid(ROWS);
+
+    let make_batch = |range: std::ops::Range<i64>| {
+        let keys: Vec<i64> = range.map(scattered).collect();
+        let values: Vec<f64> = keys.iter().map(|k| *k as f64 * 1.5).collect();
+        let payload: Vec<i64> = keys.iter().map(|k| k.wrapping_mul(7)).collect();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(keys)),
+                Arc::new(Float64Array::from(values)),
+                Arc::new(Int64Array::from(payload)),
+            ],
+        )
+        .unwrap()
+    };
+    let all_batches = || {
+        (0..ROWS / ROWS_PER_SEGMENT)
+            .map(|segment| {
+                let start = segment * ROWS_PER_SEGMENT;
+                make_batch(start..start + ROWS_PER_SEGMENT)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let build = |name: &'static str, filters: BloomFilters| {
+        let schema = schema.clone();
+        let path = dir.path().join(format!("{name}.lt"));
+        runtime.block_on(async move {
+            let table = ColumnarTable::create(
+                &path,
+                schema,
+                TableOptions {
+                    durability: Durability::None,
+                    io_backend: IoBackend::Mmap,
+                    memtable_max_bytes: 64 * 1024 * 1024,
+                    bloom_filters: filters,
+                    ..TableOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            for batch in all_batches() {
+                table.insert(&[batch]).await.unwrap();
+                table.flush().await.unwrap();
+            }
+            table
+        })
+    };
+
+    let build_pq = |name: &str, blooms: bool| {
+        let path = dir.path().join(format!("{name}.parquet"));
+        let file = std::fs::File::create(&path).unwrap();
+        let properties = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(ROWS_PER_SEGMENT as usize))
+            .set_bloom_filter_enabled(blooms)
+            .build();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(properties)).unwrap();
+        for batch in all_batches() {
+            writer.write(&batch).unwrap();
+        }
+        writer.close().unwrap();
+        path
+    };
+
+    // Every variant is built in one process, so they are compared against each
+    // other and never against a number from another run.
+    let ctx = SessionContext::new_with_config(
+        SessionConfig::new()
+            .with_target_partitions(4)
+            .set_bool("datafusion.execution.parquet.bloom_filter_on_read", true),
+    );
+    ctx.register_table(
+        "no_filter",
+        Arc::new(ColumnarTableProvider::new(build("no_filter", BloomFilters::None))),
+    )
+    .unwrap();
+    ctx.register_table(
+        "filter",
+        Arc::new(ColumnarTableProvider::new(build(
+            "filter",
+            BloomFilters::Columns(vec!["key".to_string()]),
+        ))),
+    )
+    .unwrap();
+    for (name, blooms) in [("pq", false), ("pq_filter", true)] {
+        let path = build_pq(name, blooms);
+        runtime
+            .block_on(ctx.register_parquet(
+                name,
+                path.to_str().unwrap(),
+                datafusion::prelude::ParquetReadOptions::default(),
+            ))
+            .unwrap();
+    }
+
+    let mut group = c.benchmark_group("scattered point lookup");
+    for table in ["no_filter", "filter", "pq", "pq_filter"] {
+        let sql = format!("SELECT * FROM {table} WHERE key = 372145");
+        group.bench_function(table, |b| b.iter(|| run(&ctx, &runtime, &sql)));
+    }
+    group.finish();
+}
+
 fn small_writes(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -596,6 +721,7 @@ criterion_group!(
     parallel_scan,
     skewed_scan,
     parquet_view_types,
+    scattered_point_lookup,
     small_writes
 );
 criterion_main!(benches);

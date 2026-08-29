@@ -139,6 +139,37 @@ as a dictionary is not a way to make a group by faster — it is a way to make t
 file smaller. The theory it was added on was wrong; the capability is still
 worth having, because before it a dictionary column could not be stored at all.
 
+## Membership filters
+
+The point lookup in the table above is on an ordered id, which zone maps already
+prune to one segment. A column of scattered values is the hard case: every
+segment's range covers the key, no range test rules any of them out, and the
+lookup reads the whole table.
+
+The same 500,000 rows, keyed by a permutation of `0..500000` so every segment
+spans the range, all four variants built and measured in one run:
+
+| variant | `WHERE key = 372145` |
+| --- | --- |
+| local, no filter | 717 µs |
+| local, filter | **463 µs** |
+| parquet, no filter | 1.68 ms |
+| parquet, filter | 696 µs |
+
+**A filter is worth about a third of the query.** 717 to 463 µs here, from
+ruling out nine segments of ten. Parquet gains more from its own filters, 1.68
+ms to 696 µs, because it had further to fall: without them its reader was doing
+more work per surviving row group than this one.
+
+What is left after filtering is one segment of 50,000 rows, read in full to find
+one row. That bound is segment granularity, not the filter, and page-level zone
+maps are what would lower it.
+
+This is the only comparison here where both formats were given the same feature.
+It is worth more than the others for that reason: `bloom_filter_on_read` is on
+by default in DataFusion, so parquet was reading its filters, and both files
+were written with matching row groups.
+
 ## Parallel scans
 
 A segment is the unit a scan gives to a partition. Partitions take segments from

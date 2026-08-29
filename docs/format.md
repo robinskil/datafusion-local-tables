@@ -208,6 +208,10 @@ Ten is the default and the knee. Below eight the rate climbs steeply, because a
 value sets eight bits and there is no longer room for them; that is what the
 single-cache-line layout charges for its locality.
 
+Measured on 500,000 scattered keys, a point lookup goes from 717 to 463 us with
+a filter; parquet, given its own filters on the same data, goes from 1.68 ms to
+696 us. `docs/performance.md` has the run.
+
 Filters are off unless a column asks for one, because they cost bits for every
 value stored. They pay on a column looked up by equality with many distinct
 values, and not on a low-cardinality column, where a zone map or a dictionary
