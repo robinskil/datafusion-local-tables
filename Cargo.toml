@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = ["crates/localtables-format", "crates/datafusion-local-tables"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+repository = "https://github.com/robinkooyman/datafusion-local-tables"
+
+[workspace.dependencies]
+localtables-format = { path = "crates/localtables-format", version = "0.1.0" }
+
+arrow = "59.2"
+arrow-buffer = "59.2"
+arrow-schema = "59.2"
+arrow-array = "59.2"
+arrow-ipc = "59.2"
+datafusion = "55"
+
+rkyv = "0.8.18"
+memmap2 = "0.9"
+roaring = "0.11"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+lz4_flex = "0.14"
+zstd = "0.13"
+arc-swap = "1.9"
+parking_lot = "0.12"
+thiserror = "2"
+tokio = "1.52"
+futures = "0.3"
+async-trait = "0.1"
+io-uring = "0.7"
+
+proptest = "1"
+criterion = "0.5"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+debug = true

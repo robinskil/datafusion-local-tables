@@ -1,0 +1,27 @@
+[package]
+name = "datafusion-local-tables"
+description = "DataFusion table providers backed by a single local file"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["mmap", "lz4"]
+mmap = ["localtables-format/mmap"]
+lz4 = ["localtables-format/lz4"]
+zstd = ["localtables-format/zstd"]
+uring = ["localtables-format/uring"]
+
+[dependencies]
+localtables-format.workspace = true
+datafusion.workspace = true
+arrow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

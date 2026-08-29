@@ -1,0 +1,45 @@
+[package]
+name = "localtables-format"
+description = "On-disk format, IO backends and storage engine for local Arrow tables"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["mmap", "lz4"]
+mmap = ["dep:memmap2"]
+lz4 = ["dep:lz4_flex"]
+zstd = ["dep:zstd"]
+uring = ["dep:io-uring"]
+# Fault-injecting IO backend, for crash-safety tests in dependent crates.
+testing = []
+
+[dependencies]
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-schema.workspace = true
+arrow-ipc.workspace = true
+
+rkyv.workspace = true
+xxhash-rust.workspace = true
+roaring.workspace = true
+arc-swap.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "macros"] }
+async-trait.workspace = true
+futures.workspace = true
+
+memmap2 = { workspace = true, optional = true }
+lz4_flex = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
