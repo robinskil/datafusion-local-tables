@@ -32,13 +32,42 @@ The **columnar table** works end to end: `SELECT`, `INSERT`, `DELETE` and
 `UPDATE` through SQL, with zone-map pruning, projection and limit pushdown,
 crash-safe commits, a write-ahead log, and compaction.
 
-The **b-tree table** works through its Rust API: point lookups, range scans,
-writes and deletes, on a copy-on-write tree with the same crash-safe commit
-protocol. Its DataFusion provider is not written yet.
+The **b-tree table** works through SQL for reads: point lookups and range
+queries push a key bound into the tree, so `WHERE id = 742` seeks rather than
+scans. Writes and deletes go through its Rust API. Underneath is a
+copy-on-write tree with the same crash-safe commit protocol.
 
 Three IO backends: mmap (default), positional reads, and io_uring on Linux.
-Still to come: the b-tree table's DataFusion provider, and nested Arrow types.
-See `docs/format.md` for the on-disk layout.
+Still to come: SQL writes for the b-tree table, and nested Arrow types. See
+`docs/format.md` for the on-disk layout.
+
+## Example
+
+```rust
+use datafusion::prelude::SessionContext;
+use datafusion_local_tables::{BTreeTableProvider, ColumnarTableProvider};
+use localtables_format::{BTreeTable, ColumnarTable, TableOptions};
+use std::sync::Arc;
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let ctx = SessionContext::new();
+
+let events = ColumnarTable::open("events.lt".as_ref(), TableOptions::default()).await?;
+ctx.register_table("events", Arc::new(ColumnarTableProvider::new(events)))?;
+
+let users = BTreeTable::open("users.ltb".as_ref(), &["id"], TableOptions::default()).await?;
+ctx.register_table("users", Arc::new(BTreeTableProvider::new(users)))?;
+
+// Prunes segments by zone map; seeks the b-tree by key.
+ctx.sql("SELECT u.name, count(*) FROM events e \
+         JOIN users u ON e.user_id = u.id \
+         WHERE e.ts > 1700000000 GROUP BY u.name")
+   .await?
+   .show()
+   .await?;
+# Ok(())
+# }
+```
 
 ## Format stability
 

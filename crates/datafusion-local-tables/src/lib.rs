@@ -21,13 +21,18 @@
 //! # }
 //! ```
 
+pub mod btree_exec;
+pub mod btree_provider;
 pub mod columnar_exec;
 pub mod columnar_provider;
 pub mod dml;
 pub mod pruning;
 
+pub use btree_exec::{BTreeScanExec, KeyRange};
+pub use btree_provider::{register_btree_table, BTreeTableProvider};
 pub use columnar_exec::ColumnarScanExec;
 pub use columnar_provider::{register_columnar_table, ColumnarTableProvider};
 pub use dml::{ColumnarDataSink, DmlExec};
 pub use localtables_format as format;
+pub use localtables_format::btree::BTreeTable;
 pub use localtables_format::ColumnarTable;
