@@ -49,6 +49,10 @@ SQL, with zone-map, membership-filter and trigram pruning, optional z-order
 clustering, projection and limit pushdown, crash-safe commits, a write-ahead
 log, and compaction.
 
+Filters and clustering are per-segment, so a table changes them by being
+rewritten: reopen with the options you want and call `rewrite_all`. The schema
+cannot change; `docs/format.md` covers what that would take.
+
 Three IO backends: mmap (default), positional reads, and io_uring on Linux.
 The io_uring backend compiles for Linux but has not been run. See
 `docs/format.md` for the on-disk layout.

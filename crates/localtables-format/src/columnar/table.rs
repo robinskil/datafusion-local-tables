@@ -658,6 +658,26 @@ impl ColumnarTable {
         self.compact_segments(&targets).await
     }
 
+    /// Rewrite every segment with the options this handle holds.
+    ///
+    /// Filters, clustering and encodings are all decided when a segment is
+    /// written, so a table gains or loses them by being rewritten and not by
+    /// being reopened. Open the table with the options you want, then call
+    /// this: it is how a table acquires a membership filter, a trigram filter
+    /// or a z-order it was not created with, and how it sheds one.
+    ///
+    /// Returns the rows rewritten. This reads every live row into memory, the
+    /// same way compaction does, so it is a maintenance operation rather than
+    /// something to run under load.
+    pub async fn rewrite_all(&self) -> Result<u64> {
+        let segment_ids: Vec<SegmentId> = self
+            .snapshot()
+            .live_segments()
+            .map(|entry| entry.segment_id)
+            .collect();
+        self.compact_segments(&segment_ids).await
+    }
+
     /// Rewrite the named segments into one, dropping their deleted rows.
     pub async fn compact_segments(&self, segment_ids: &[SegmentId]) -> Result<u64> {
         if segment_ids.is_empty() {

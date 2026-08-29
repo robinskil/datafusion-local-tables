@@ -333,6 +333,42 @@ rows the delete removed.
 An `UPDATE` is a delete and an insert in one log record, so a crash can never
 leave the old rows gone and the new ones missing.
 
+## Changing a table
+
+Filters, clustering and encodings are properties of a *segment*, not of the
+file. A segment records what it was written with, and a reader that finds no
+filter treats it as no information rather than as an error. So these change by
+rewriting, not by any change to the file's header:
+
+```rust
+let table = ColumnarTable::open(path, options_you_want).await?;
+table.rewrite_all().await?;
+```
+
+`rewrite_all` is compaction over every live segment. It applies the current
+options to data already stored, which is how a table acquires a membership
+filter, a trigram filter or a z-order it was not created with, and how it sheds
+one. It reads every live row into memory, so it is maintenance rather than
+something to run under load.
+
+Rewriting to cluster by one column costs another its locality, since there is
+only one row order. A trigram filter on text that was grouped by segment before
+the rewrite can come out pruning nothing afterwards, still correct and no longer
+useful.
+
+**The schema cannot change.** Adding, dropping, renaming or retyping a column is
+not supported, and opening with a schema that does not match the stored
+fingerprint is refused. Two things in the format stand in the way, and both are
+format changes rather than missing plumbing:
+
+* the schema lives in the file header, which is written once and never
+  rewritten, so there is nowhere to record a new one;
+* a segment addresses its columns by position, so dropping a column would
+  silently shift every column after it in every segment already written.
+
+Stable field identifiers in `SegmentMeta`, and the schema moved into the
+manifest where every commit rewrites it, are what these would need.
+
 ## Alignment
 
 | boundary | value | reason |
