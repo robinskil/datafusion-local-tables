@@ -3,14 +3,11 @@
 DataFusion table providers backed by a single local file.
 
 Local files permit things an object store cannot: memory mapping, io_uring, and
-handing the page cache straight to a query with no copy in between. This crate
-builds two table shapes on that idea.
+handing the page cache straight to a query with no copy in between.
 
-* **Columnar table** — parquet-like. Zone maps, dictionary and run-length
-  encodings, per-page compression. Supports inserts, deletes and updates.
-  Built for fast, memory-efficient scans.
-* **B-tree table** — copy-on-write B+tree. Built for point lookups and key
-  range scans.
+The table is parquet-like: zone maps, membership filters, dictionary and
+run-length encodings, per-page compression. It supports inserts, deletes and
+updates, and is built for fast, memory-efficient scans.
 
 Scans divide across threads at segment granularity, which is this format's row
 group — the same unit a parquet reader divides a file by.
@@ -27,52 +24,56 @@ GeoArrow geometries round-trip, four levels of nesting and extension metadata
 included. Zone maps stay type-specific: a type with no order this format can
 record simply prunes nothing.
 
+Equality is the case zone maps handle worst, because a column of scattered
+values leaves every segment's range covering the value being looked for. A
+column can opt into a membership filter, which rules out the segments that
+cannot hold a value at all.
+
 ## Layout
 
 | crate | contents |
 | --- | --- |
-| `localtables-format` | on-disk format, IO backends, WAL, storage engines |
+| `localtables-format` | on-disk format, IO backends, WAL, storage engine |
 | `datafusion-local-tables` | the DataFusion `TableProvider` implementations |
 
 ## Status
 
 Under construction.
 
-The **columnar table** works end to end: `SELECT`, `INSERT`, `DELETE` and
-`UPDATE` through SQL, with zone-map pruning, projection and limit pushdown,
-crash-safe commits, a write-ahead log, and compaction.
-
-The **b-tree table** works through SQL for reads: point lookups and range
-queries push a key bound into the tree, so `WHERE id = 742` seeks rather than
-scans. Writes and deletes go through its Rust API. Underneath is a
-copy-on-write tree with the same crash-safe commit protocol.
+The table works end to end: `SELECT`, `INSERT`, `DELETE` and `UPDATE` through
+SQL, with zone-map and membership-filter pruning, projection and limit
+pushdown, crash-safe commits, a write-ahead log, and compaction.
 
 Three IO backends: mmap (default), positional reads, and io_uring on Linux.
-Still to come: SQL writes for the b-tree table, and nested Arrow types. See
+The io_uring backend compiles for Linux but has not been run. See
 `docs/format.md` for the on-disk layout.
+
+An earlier version carried a second table kind, a copy-on-write b-tree for
+point lookups. It was removed: a file written by it cannot be opened by this
+build.
 
 ## Example
 
 ```rust
 use datafusion::prelude::SessionContext;
-use datafusion_local_tables::{BTreeTableProvider, ColumnarTableProvider};
-use localtables_format::{BTreeTable, ColumnarTable, TableOptions};
+use datafusion_local_tables::ColumnarTableProvider;
+use localtables_format::{BloomFilters, ColumnarTable, TableOptions};
 use std::sync::Arc;
 
 async fn example() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
 
-    let events = ColumnarTable::open("events.lt".as_ref(), TableOptions::default()).await?;
+    // `user_id` is looked up by equality, so it gets a membership filter.
+    let options = TableOptions::default()
+        .with_bloom_filters(BloomFilters::Columns(vec!["user_id".to_string()]));
+
+    let events = ColumnarTable::open("events.lt".as_ref(), options).await?;
     ctx.register_table("events", Arc::new(ColumnarTableProvider::new(events)))?;
 
-    let users = BTreeTable::open("users.ltb".as_ref(), &["id"], TableOptions::default()).await?;
-    ctx.register_table("users", Arc::new(BTreeTableProvider::new(users)))?;
-
-    // Prunes segments by zone map; seeks the b-tree by key.
+    // The range prunes by zone map, the equality by membership filter.
     ctx.sql(
-        "SELECT u.name, count(*) FROM events e \
-         JOIN users u ON e.user_id = u.id \
-         WHERE e.ts > 1700000000 GROUP BY u.name",
+        "SELECT count(*) FROM events \
+         WHERE ts > 1700000000 AND user_id = 8143",
     )
     .await?
     .show()

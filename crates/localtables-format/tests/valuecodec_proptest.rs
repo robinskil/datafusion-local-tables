@@ -13,7 +13,7 @@ use arrow_array::{
 };
 use proptest::prelude::*;
 
-use localtables_format::btree::keycodec::{encode_row, encode_value, prefix_upper_bound};
+use localtables_format::valuecodec::{encode_row, encode_value, prefix_upper_bound};
 
 /// Encode one value of a single-column key.
 fn key(array: &ArrayRef, row: usize) -> Vec<u8> {

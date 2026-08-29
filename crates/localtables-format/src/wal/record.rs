@@ -12,15 +12,6 @@ use crate::layout::manifest::SegmentId;
 /// A log sequence number. Rises by one per record and never repeats.
 pub type Lsn = u64;
 
-/// One key's fate: a row to store, or nothing when the key is deleted.
-#[derive(Archive, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[rkyv(derive(Debug))]
-pub struct KeyChange {
-    pub key: Vec<u8>,
-    /// The packed row, or absent when this change removes the key.
-    pub row: Option<Vec<u8>>,
-}
-
 /// Rows deleted from one segment, as a serialized roaring bitmap.
 #[derive(Archive, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[rkyv(derive(Debug))]
@@ -56,10 +47,6 @@ pub enum WalRecord {
         base_seqno: u64,
         batch: BatchData,
     },
-    /// Keys written or removed in a b-tree table.
-    ///
-    /// One record covers a whole statement, so a crash cannot apply half of it.
-    BTree { lsn: Lsn, changes: Vec<KeyChange> },
 }
 
 impl WalRecord {
@@ -67,8 +54,7 @@ impl WalRecord {
         match self {
             WalRecord::Insert { lsn, .. }
             | WalRecord::Delete { lsn, .. }
-            | WalRecord::Update { lsn, .. }
-            | WalRecord::BTree { lsn, .. } => *lsn,
+            | WalRecord::Update { lsn, .. } => *lsn,
         }
     }
 }
@@ -78,8 +64,7 @@ impl ArchivedWalRecord {
         match self {
             ArchivedWalRecord::Insert { lsn, .. }
             | ArchivedWalRecord::Delete { lsn, .. }
-            | ArchivedWalRecord::Update { lsn, .. }
-            | ArchivedWalRecord::BTree { lsn, .. } => lsn.to_native(),
+            | ArchivedWalRecord::Update { lsn, .. } => lsn.to_native(),
         }
     }
 
@@ -89,7 +74,6 @@ impl ArchivedWalRecord {
             ArchivedWalRecord::Insert { .. } => "insert",
             ArchivedWalRecord::Delete { .. } => "delete",
             ArchivedWalRecord::Update { .. } => "update",
-            ArchivedWalRecord::BTree { .. } => "btree",
         }
     }
 }
@@ -130,19 +114,6 @@ mod tests {
                     bitmap: vec![1, 2, 3, 4],
                 }],
                 memtable_rows: vec![10, 11],
-            },
-            WalRecord::BTree {
-                lsn: 4,
-                changes: vec![
-                    KeyChange {
-                        key: b"a".to_vec(),
-                        row: Some(b"row".to_vec()),
-                    },
-                    KeyChange {
-                        key: b"b".to_vec(),
-                        row: None,
-                    },
-                ],
             },
             WalRecord::Update {
                 lsn: 3,

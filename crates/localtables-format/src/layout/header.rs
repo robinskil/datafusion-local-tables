@@ -137,3 +137,60 @@ impl ArchivedMetaPage {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header() -> FileHeader {
+        FileHeader::new(TableKind::Columnar, [7u8; 16], Extent::new(4096, 128), 0xabcd)
+    }
+
+    /// Read a header back the way an open does, so `validate` sees an archive
+    /// rather than the struct it was built from.
+    fn validate(header: &FileHeader) -> crate::Result<()> {
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(header).unwrap();
+        rkyv::access::<ArchivedFileHeader, rkyv::rancor::Error>(&bytes)
+            .unwrap()
+            .validate(TableKind::Columnar)
+    }
+
+    #[test]
+    fn a_header_this_build_wrote_is_accepted() {
+        validate(&header()).unwrap();
+    }
+
+    /// The guard that refuses a file from an older format, including one
+    /// written by the b-tree engine that this format no longer has.
+    #[test]
+    fn an_older_format_version_is_refused() {
+        let older = FileHeader {
+            format_version: FORMAT_VERSION - 1,
+            ..header()
+        };
+        let err = validate(&older).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_newer_format_version_is_refused_too() {
+        let newer = FileHeader {
+            format_version: FORMAT_VERSION + 1,
+            ..header()
+        };
+        assert!(validate(&newer).is_err());
+    }
+
+    #[test]
+    fn the_wrong_magic_is_refused() {
+        let wrong = FileHeader {
+            magic: MAGIC ^ 1,
+            ..header()
+        };
+        let err = validate(&wrong).unwrap_err();
+        assert!(matches!(err, crate::Error::BadMagic(_)), "got {err:?}");
+    }
+}

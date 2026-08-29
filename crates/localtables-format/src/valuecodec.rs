@@ -1,13 +1,18 @@
-//! Keys as bytes that sort the same way the values do.
+//! One canonical byte form per Arrow value.
 //!
-//! A b-tree compares keys with `memcmp`, so a key's byte form has to order
-//! identically to the value it came from. That takes work per type: signed
-//! integers need their sign bit flipped, floats need their sign and magnitude
-//! rearranged, and strings need an escape so that a shorter key never looks
-//! larger than a longer one it prefixes.
+//! Membership filters hash values, and a value has to hash the same whether it
+//! arrived as a row of a column or as a literal inside a predicate. That is
+//! what this provides: one value, one byte string, whatever route it took.
 //!
-//! Every encoding here is reversible, so a scan can hand back the key columns
-//! without reading the row.
+//! The encoding also orders: the bytes compare with `memcmp` the way the values
+//! compare. That takes work per type — signed integers need their sign bit
+//! flipped, floats need their sign and magnitude rearranged, strings need an
+//! escape so a shorter string never looks larger than one it prefixes — and
+//! nothing depends on it today. It is kept because it is what makes the
+//! encoding canonical in the first place: an order-preserving encoding cannot
+//! give one value two spellings, which is exactly the property a filter needs.
+//!
+//! Every encoding here is reversible.
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::*;

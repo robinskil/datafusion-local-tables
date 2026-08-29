@@ -18,7 +18,7 @@
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
 
-use crate::btree::keycodec;
+use crate::valuecodec;
 use crate::{Error, Result};
 
 /// Words in a block. Eight 32-bit words is 32 bytes: one cache line.
@@ -162,7 +162,7 @@ impl BloomFilter {
                 continue;
             }
             bytes.clear();
-            keycodec::encode_value(&mut bytes, array, row)?;
+            valuecodec::encode_value(&mut bytes, array, row)?;
             filter.insert_hash(crate::layout::checksum(&bytes));
         }
         Ok(Some(filter))
@@ -201,16 +201,13 @@ fn hash_value(value: &ArrayRef, data_type: &DataType) -> Option<u64> {
     }
 
     let mut bytes = Vec::with_capacity(32);
-    keycodec::encode_value(&mut bytes, array.as_ref(), 0).ok()?;
+    valuecodec::encode_value(&mut bytes, array.as_ref(), 0).ok()?;
     Some(crate::layout::checksum(&bytes))
 }
 
 /// True for the types a value can be hashed canonically as.
-///
-/// The same encoding the b-tree uses for keys, so a value hashes identically
-/// whether it arrived as a column or as a literal in a predicate.
 pub fn supports(data_type: &DataType) -> bool {
-    keycodec::is_encodable(data_type)
+    valuecodec::is_encodable(data_type)
 }
 
 #[cfg(test)]
@@ -235,7 +232,7 @@ mod tests {
 
         for (row, value) in values.iter().enumerate() {
             let mut bytes = Vec::new();
-            keycodec::encode_value(&mut bytes, &array, row).unwrap();
+            valuecodec::encode_value(&mut bytes, &array, row).unwrap();
             assert!(
                 filter.may_contain_hash(crate::layout::checksum(&bytes)),
                 "value {value} was reported absent"
@@ -251,7 +248,7 @@ mod tests {
 
         for row in 0..array.len() {
             let mut bytes = Vec::new();
-            keycodec::encode_value(&mut bytes, &array, row).unwrap();
+            valuecodec::encode_value(&mut bytes, &array, row).unwrap();
             assert!(filter.may_contain_hash(crate::layout::checksum(&bytes)));
         }
     }

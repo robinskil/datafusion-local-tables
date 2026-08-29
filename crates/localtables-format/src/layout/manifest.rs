@@ -53,21 +53,6 @@ pub struct FreeExtent {
     pub freed_txn: u64,
 }
 
-/// The root of a b-tree, as a manifest records it.
-///
-/// A columnar table leaves this empty; a b-tree table leaves `segments` empty.
-/// One manifest type serves both, so the commit protocol, the free list and
-/// the recovery path are written once rather than twice.
-#[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[rkyv(derive(Debug))]
-pub struct TreeRootEntry {
-    /// The root page. Empty when the tree holds nothing.
-    pub root: Extent,
-    pub rows: u64,
-    /// Levels between the root and a leaf. Zero when the root is a leaf.
-    pub height: u32,
-}
-
 /// The complete state of a table at one commit.
 #[derive(Archive, Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[rkyv(derive(Debug))]
@@ -79,8 +64,6 @@ pub struct Manifest {
     /// Next row sequence number the memtable will hand out.
     pub next_seqno: u64,
     pub segments: Vec<SegmentEntry>,
-    /// The b-tree's root, for a b-tree table. Empty for a columnar one.
-    pub tree: TreeRootEntry,
     pub free_extents: Vec<FreeExtent>,
     /// End of the allocated region. New extents start here when no free extent fits.
     pub file_len: u64,
@@ -95,7 +78,6 @@ impl Manifest {
             next_segment_id: 0,
             next_seqno: 0,
             segments: Vec::new(),
-            tree: TreeRootEntry::default(),
             free_extents: Vec::new(),
             file_len,
         }
@@ -149,11 +131,6 @@ impl ArchivedManifest {
                     deletes: s.deletes.as_ref().map(|e| e.to_native()),
                 })
                 .collect(),
-            tree: TreeRootEntry {
-                root: self.tree.root.to_native(),
-                rows: self.tree.rows.to_native(),
-                height: self.tree.height.to_native(),
-            },
             free_extents: self
                 .free_extents
                 .iter()

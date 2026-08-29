@@ -12,17 +12,16 @@
 //! This crate holds the format and the engine. The DataFusion providers live in
 //! the `datafusion-local-tables` crate.
 
-pub mod btree;
 pub mod columnar;
 pub mod config;
 pub mod error;
 pub mod io;
 pub mod layout;
 pub mod snapshot;
+pub mod valuecodec;
 pub mod table_file;
 pub mod wal;
 
-pub use btree::{BTreeSnapshot, BTreeTable};
 pub use columnar::ColumnarTable;
 pub use config::{BloomFilters, Compression, Durability, IoBackend, TableOptions};
 pub use error::{Error, Result};

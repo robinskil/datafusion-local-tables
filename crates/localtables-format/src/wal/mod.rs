@@ -19,7 +19,7 @@ use crate::config::Durability;
 use crate::{Error, Result};
 
 pub use file::{encode_record, RecoveredLog, WalFile, WalHeader, WAL_HEADER_LEN};
-pub use record::{KeyChange, Lsn, SegmentDeletes, WalRecord};
+pub use record::{Lsn, SegmentDeletes, WalRecord};
 
 /// The two log files belonging to one table.
 ///

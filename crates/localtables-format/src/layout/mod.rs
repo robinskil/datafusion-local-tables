@@ -12,7 +12,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 pub const MAGIC: u64 = u64::from_le_bytes(*b"DFLT\0\0\0\x01");
 
 /// Bump on any change that makes older readers wrong.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Size of the header and of each meta page.
 pub const HEADER_SIZE: u64 = 4096;
@@ -40,7 +40,6 @@ pub const SEGMENT_ALIGN: u64 = 4096;
 #[repr(u8)]
 pub enum TableKind {
     Columnar = 0,
-    BTree = 1,
 }
 
 /// A contiguous byte range inside the table file.

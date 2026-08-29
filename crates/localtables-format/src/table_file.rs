@@ -758,17 +758,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opening_with_the_wrong_kind_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("table.lt");
-        create(&dir).await;
-        let err = TableFile::open(&path, TableKind::BTree, options())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::BadMagic(_)), "got {err:?}");
-    }
-
-    #[tokio::test]
     async fn open_or_create_rejects_a_different_schema() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("table.lt");

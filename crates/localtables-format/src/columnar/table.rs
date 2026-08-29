@@ -798,14 +798,6 @@ fn replay(writer: &mut Writer, checkpoint_lsn: Lsn) -> Result<()> {
                 let batch = decode_batch(&batch, writer.memtable.schema())?;
                 writer.memtable.insert_at(base_seqno, batch);
             }
-            // A b-tree table's log has no place in a columnar table. The log
-            // header carries the table's identity, so this means the file was
-            // damaged rather than mismatched.
-            WalRecord::BTree { .. } => {
-                return Err(Error::corrupt(
-                    "a columnar table's log holds a b-tree record",
-                ))
-            }
         }
     }
 

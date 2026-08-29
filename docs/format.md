@@ -182,6 +182,46 @@ a partial one, compaction leaves uneven ones, a compressed segment costs more to
 decode than a mapped one — so a split decided before any of them is read is
 guessing.
 
+## Membership filters
+
+A zone map prunes `col = x` only when `x` sits outside a segment's minimum and
+maximum. That works for a column written in order and fails for one whose values
+are scattered: every segment's range covers the value, nothing is ruled out, and
+a point lookup reads the whole table.
+
+A column can carry a membership filter instead, which answers a narrower
+question: is this value definitely absent? It never says absent when a value is
+present, so acting on that answer cannot lose a row. It does say "may be
+present" for values that are not, which costs a segment read.
+
+The layout is the split-block filter parquet uses. All eight bits for one value
+land in a single 32-byte block, so a lookup touches one cache line. Measured
+false positive rates over 65,536 values:
+
+| bits per value | false positives | filter size |
+| --- | --- | --- |
+| 6 | 9.9% | 48 KiB |
+| 10 | 1.2% | 80 KiB |
+| 16 | 0.13% | 128 KiB |
+
+Ten is the default and the knee. Below eight the rate climbs steeply, because a
+value sets eight bits and there is no longer room for them; that is what the
+single-cache-line layout charges for its locality.
+
+Filters are off unless a column asks for one, because they cost bits for every
+value stored. They pay on a column looked up by equality with many distinct
+values, and not on a low-cardinality column, where a zone map or a dictionary
+already answers.
+
+A filter is stored as a buffer the decoder skips, not inside the metadata
+frame, so it costs nothing to open a segment that has one. Pruning reads only
+the filters for columns a predicate actually mentions.
+
+Values hash through `valuecodec`, the same canonical byte form for a value in a
+column and a literal in a predicate. A literal of a different type is cast
+first; one that cannot be cast, or that casts to null, is unknown rather than
+absent.
+
 ## Deletes and compaction
 
 Segments never change once written, so a delete records row positions in a
@@ -204,46 +244,6 @@ leave the old rows gone and the new ones missing.
 | Arrow buffers, frames | 64 bytes | widest SIMD register Arrow targets; also satisfies rkyv's 16 |
 | segment starts | 4096 bytes | a segment is mapped on its own |
 
-## The b-tree table
-
-A second table kind, in the same file format: same header, same two meta pages,
-same commit protocol, same free list. Only the manifest differs — a columnar
-table fills `segments`, a b-tree table fills `tree`.
-
-Rows are stored whole, ordered by a memcomparable key, so a point lookup reads
-one page per level instead of scanning.
-
-### Keys
-
-A b-tree compares keys with `memcmp`, so the byte form has to order identically
-to the value:
-
-* signed integers get their sign bit flipped, so the signed range maps onto the
-  unsigned one in order;
-* floats get their sign and magnitude rearranged, and negative zero is
-  normalised to positive zero — they are equal as numbers, and a key that told
-  them apart would let a lookup for `0.0` miss a row stored as `-0.0`;
-* strings and binary escape `0x00` as `00 FF` and end with `00 00`, so a
-  shorter key never looks larger than a longer one it prefixes;
-* every value carries a tag byte, so null sorts before everything.
-
-Multi-column keys are the concatenation, which orders by each column in turn.
-
-### The tree
-
-Copy-on-write, built bottom-up. A flush merges the pending overlay with the
-existing entries, writes fresh leaves, then fresh branches over them, and
-commits a new root. Nothing on disk is overwritten, so a reader on the old root
-keeps walking a complete tree, and there is no torn page to recover: the root
-points at one whole tree or the other.
-
-Rewriting whole levels costs more per write than editing pages in place. That
-is the trade the write-ahead log pays for: small writes go to the log and a
-sorted overlay, and only a flush touches the tree.
-
-A leaf holds up to 256 keys and a branch up to 256 children, so three levels
-hold sixteen million rows. Branch separators are the largest key beneath each
-child, which lets a range scan skip a whole subtree without reading it.
 
 ## IO backends
 
