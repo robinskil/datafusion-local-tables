@@ -26,10 +26,11 @@ can decode one column without touching the others.
 
 ## Status
 
-Under construction. The storage engine is working: file format, IO backends,
-crash-safe commits, segments with encodings and zone maps, snapshots, delete
-vectors, and a write-ahead log with a memtable. The DataFusion providers and
-the b-tree table are next. See `docs/format.md` for the on-disk layout.
+Under construction. The columnar table works end to end: `SELECT`, `INSERT`,
+`DELETE` and `UPDATE` through SQL, with zone-map pruning, projection and limit
+pushdown, crash-safe commits, a write-ahead log, and compaction. Still to come:
+the io_uring backend, the b-tree table, and nested Arrow types. See
+`docs/format.md` for the on-disk layout.
 
 ## Format stability
 

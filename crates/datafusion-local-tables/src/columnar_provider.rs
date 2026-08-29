@@ -8,7 +8,9 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{Result, Statistics};
+use datafusion::common::{DataFusionError, Result, Statistics};
+use datafusion::datasource::sink::DataSinkExec;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
 use datafusion::physical_plan::ExecutionPlan;
@@ -17,6 +19,7 @@ use localtables_format::columnar::table::ColumnarTable;
 use localtables_format::layout::manifest::SegmentEntry;
 
 use crate::columnar_exec::{to_df_error, ColumnarScanExec};
+use crate::dml::{compile_assignments, compile_predicate, ColumnarDataSink, DmlExec};
 use crate::pruning::{SegmentStatistics, SegmentZoneMaps};
 
 /// Exposes a [`ColumnarTable`] to DataFusion.
@@ -103,6 +106,68 @@ impl TableProvider for ColumnarTableProvider {
             state.config().target_partitions(),
             pruned,
         )?))
+    }
+
+    /// `INSERT INTO`.
+    ///
+    /// Rows stream into the write-ahead log; each batch is durable before the
+    /// next is read, and queryable as soon as it lands.
+    async fn insert_into(
+        &self,
+        _state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        match insert_op {
+            InsertOp::Append => {}
+            other => {
+                // Overwrite and replace would have to decide what to do with
+                // rows a concurrent reader is pinned to; appending is the only
+                // one this engine implements today.
+                return Err(DataFusionError::NotImplemented(format!(
+                    "{other:?} is not supported; only INSERT ... VALUES / SELECT"
+                )));
+            }
+        }
+
+        Ok(Arc::new(DataSinkExec::new(
+            input,
+            Arc::new(ColumnarDataSink::new(self.table.clone())),
+            None,
+        )))
+    }
+
+    /// `DELETE FROM`.
+    ///
+    /// With no `WHERE`, every row goes. With one, the rows it selects are found
+    /// by reading the segments the zone maps cannot rule out.
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let predicate = compile_predicate(state, &self.schema(), &filters)?;
+        Ok(Arc::new(DmlExec::delete(self.table.clone(), predicate)))
+    }
+
+    /// `UPDATE`.
+    ///
+    /// Matching rows are deleted and their replacements appended, as one
+    /// durable record.
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = self.schema();
+        let predicate = compile_predicate(state, &schema, &filters)?;
+        let assignments = compile_assignments(state, &schema, &assignments)?;
+        Ok(Arc::new(DmlExec::update(
+            self.table.clone(),
+            predicate,
+            assignments,
+        )))
     }
 }
 

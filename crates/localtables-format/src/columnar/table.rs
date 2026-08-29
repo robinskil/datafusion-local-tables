@@ -284,63 +284,93 @@ impl ColumnarTable {
         }
         let mut writer = self.inner.writer.lock().await;
 
-        // Work out what actually changes before logging anything, so a delete
-        // that removes nothing writes nothing.
-        let mut updated: Vec<(SegmentId, DeleteVector)> = Vec::new();
-        let mut deleted = 0u64;
-        for (segment_id, positions) in segment_deletions {
-            let Some(entry) = writer.file.manifest().segment(*segment_id).cloned() else {
-                return Err(Error::InvalidArgument(format!(
-                    "segment {segment_id} is not in this table"
-                )));
-            };
-            let mut dv = writer.deletes_for(*segment_id);
-            let before = dv.len();
-            dv.delete_all(
-                positions
-                    .iter()
-                    .copied()
-                    .filter(|p| (*p as u64) < entry.row_count),
-            );
-            if dv.len() > before {
-                deleted += dv.len() - before;
-                updated.push((*segment_id, dv));
-            }
-        }
-
-        let memtable_hits: Vec<u64> = memtable_seqnos
-            .iter()
-            .copied()
-            .filter(|seqno| !writer.memtable.is_deleted(*seqno))
-            .collect();
-
-        if updated.is_empty() && memtable_hits.is_empty() {
+        let planned = plan_deletes(&writer, segment_deletions, memtable_seqnos)?;
+        if planned.is_empty() {
             return Ok(0);
         }
 
         let record = WalRecord::Delete {
             lsn: writer.take_lsn(),
-            segments: updated
-                .iter()
-                .map(|(id, dv)| {
-                    Ok(SegmentDeletes {
-                        segment_id: *id,
-                        bitmap: dv.to_bitmap_bytes()?,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?,
-            memtable_rows: memtable_hits.clone(),
+            segments: planned.logged_segments()?,
+            memtable_rows: planned.memtable.clone(),
         };
         writer.wal.append_group(&[encode_record(&record)?])?;
 
-        for (segment_id, dv) in updated {
-            writer.deletes.insert(segment_id, Arc::new(dv));
-            writer.dirty_deletes.insert(segment_id);
-        }
-        deleted += writer.memtable.delete(memtable_hits);
-
+        let deleted = apply_deletes(&mut writer, planned);
         self.publish(&writer)?;
         Ok(deleted)
+    }
+
+    /// Replace rows: delete the ones named, and append their replacements.
+    ///
+    /// Both halves go into one log record, so a crash can never leave the old
+    /// rows gone and the new ones missing. Returns how many rows were replaced.
+    pub async fn update(
+        &self,
+        segment_deletions: &[(SegmentId, Vec<u32>)],
+        memtable_seqnos: &[u64],
+        replacements: &[RecordBatch],
+    ) -> Result<u64> {
+        let replacement_rows: u64 = replacements.iter().map(|b| b.num_rows() as u64).sum();
+        if segment_deletions.is_empty() && memtable_seqnos.is_empty() && replacement_rows == 0 {
+            return Ok(0);
+        }
+        for batch in replacements {
+            if batch.schema().fields() != self.inner.schema.fields() {
+                return Err(Error::SchemaMismatch(format!(
+                    "a replacement batch has schema {:?}, the table expects {:?}",
+                    batch.schema(),
+                    self.inner.schema
+                )));
+            }
+        }
+
+        let mut writer = self.inner.writer.lock().await;
+        let planned = plan_deletes(&writer, segment_deletions, memtable_seqnos)?;
+        if planned.is_empty() && replacement_rows == 0 {
+            return Ok(0);
+        }
+
+        // The replacements are concatenated so the record carries one batch,
+        // which keeps the delete and the insert inseparable.
+        let merged = match replacements.len() {
+            0 => None,
+            1 => Some(replacements[0].clone()),
+            _ => Some(arrow_select::concat::concat_batches(
+                &self.inner.schema,
+                replacements,
+            )?),
+        };
+
+        let base_seqno = writer.memtable.next_seqno();
+        let record = WalRecord::Update {
+            lsn: writer.take_lsn(),
+            segments: planned.logged_segments()?,
+            memtable_rows: planned.memtable.clone(),
+            base_seqno,
+            batch: match &merged {
+                Some(batch) => crate::layout::batchcodec::encode(batch),
+                None => crate::layout::batchcodec::encode(&RecordBatch::new_empty(
+                    self.inner.schema.clone(),
+                )),
+            },
+        };
+        writer.wal.append_group(&[encode_record(&record)?])?;
+
+        // Delete first, then insert: the replacements are new rows and must not
+        // be caught by the deletion that made room for them.
+        let deleted = apply_deletes(&mut writer, planned);
+        if let Some(batch) = merged {
+            writer.memtable.insert_at(base_seqno, batch);
+        }
+
+        self.publish(&writer)?;
+        let needs_flush = self.should_flush(&writer);
+        drop(writer);
+        if needs_flush {
+            self.flush().await?;
+        }
+        Ok(deleted.max(replacement_rows))
     }
 
     /// Delete every row of the named segments.
@@ -553,6 +583,115 @@ impl ColumnarTable {
         Ok(out)
     }
 
+    /// Rewrite the segments deletes have hollowed out.
+    ///
+    /// A deleted row still occupies its bytes until the segment is rewritten
+    /// without it. Compaction reads the live rows of the chosen segments,
+    /// writes them as one new segment, and frees the old ones. Readers pinned
+    /// to an older snapshot keep reading the old bytes; the allocator will not
+    /// hand them out until those readers are gone.
+    ///
+    /// Returns how many rows the new segment holds. Nothing to do returns zero
+    /// without committing.
+    pub async fn compact(&self, dead_ratio: f64) -> Result<u64> {
+        let targets = self.compaction_candidates(dead_ratio);
+        if targets.is_empty() {
+            return Ok(0);
+        }
+        self.compact_segments(&targets).await
+    }
+
+    /// Rewrite the named segments into one, dropping their deleted rows.
+    pub async fn compact_segments(&self, segment_ids: &[SegmentId]) -> Result<u64> {
+        if segment_ids.is_empty() {
+            return Ok(0);
+        }
+
+        // Read outside the writer lock: the segments are immutable, and a
+        // rewrite of a large table should not block writes while it reads.
+        let snapshot = self.snapshot();
+        let mut live: Vec<RecordBatch> = Vec::new();
+        let mut sources = Vec::with_capacity(segment_ids.len());
+        for segment_id in segment_ids {
+            let Some(entry) = snapshot.manifest.segment(*segment_id).cloned() else {
+                return Err(Error::InvalidArgument(format!(
+                    "segment {segment_id} is not in this table"
+                )));
+            };
+            live.extend(self.read_segment(&snapshot, &entry, None).await?);
+            sources.push(entry);
+        }
+
+        let mut writer = self.inner.writer.lock().await;
+
+        // A delete may have landed while the rows above were being read. That
+        // makes the rewrite stale, so it is abandoned rather than resurrecting
+        // rows the delete removed.
+        for entry in &sources {
+            let current = writer
+                .deletes
+                .get(&entry.segment_id)
+                .map_or(0, |dv| dv.len());
+            let when_read = snapshot
+                .deletes_for(entry.segment_id)
+                .map_or(0, |dv| dv.len());
+            if current != when_read {
+                return Ok(0);
+            }
+        }
+
+        let mut manifest = writer.file.manifest().clone();
+        manifest.txn_id = writer.file.meta().txn_id + 1;
+        let min_active = self.inner.registry.min_active_txn();
+        let rows: u64 = live.iter().map(|b| b.num_rows() as u64).sum();
+
+        if rows > 0 {
+            let segment_id = manifest.next_segment_id;
+            let built = build_segment(
+                segment_id,
+                &self.inner.schema,
+                self.inner.schema_fingerprint,
+                &live,
+                &self.inner.options,
+            )?;
+            let data = writer
+                .file
+                .write_allocated(&mut manifest, &built.bytes, SEGMENT_ALIGN, min_active)
+                .await?;
+            let (_, meta) = built.placed(data.offset);
+
+            manifest.next_segment_id += 1;
+            manifest.segments.push(SegmentEntry {
+                segment_id,
+                data,
+                meta,
+                row_count: built.row_count,
+                deleted_count: 0,
+                deletes: None,
+            });
+        }
+
+        // The rewritten segments and their bitmaps are garbage as of this
+        // commit, not before it.
+        manifest.segments.retain(|entry| {
+            if !segment_ids.contains(&entry.segment_id) {
+                return true;
+            }
+            false
+        });
+        for entry in &sources {
+            manifest.free(entry.data);
+            if let Some(dv) = entry.deletes {
+                manifest.free(dv);
+            }
+            writer.deletes.remove(&entry.segment_id);
+            writer.dirty_deletes.remove(&entry.segment_id);
+        }
+
+        self.commit(&mut writer, manifest).await?;
+        Ok(rows)
+    }
+
     /// Segments worth rewriting, because deletes now dominate them.
     pub fn compaction_candidates(&self, dead_ratio: f64) -> Vec<SegmentId> {
         let snapshot = self.inner.current.load();
@@ -677,6 +816,89 @@ fn apply_logged_deletes(writer: &mut Writer, segments: Vec<SegmentDeletes>) -> R
         writer.dirty_deletes.insert(logged.segment_id);
     }
     Ok(())
+}
+
+/// The deletions a statement will actually make.
+///
+/// Worked out before anything is logged, so a delete that removes nothing
+/// writes nothing.
+#[derive(Debug, Default)]
+struct PlannedDeletes {
+    /// The new bitmap for each segment that changes.
+    segments: Vec<(SegmentId, DeleteVector)>,
+    /// Memtable rows that are not already deleted.
+    memtable: Vec<u64>,
+    /// Rows this removes that were not already gone.
+    count: u64,
+}
+
+impl PlannedDeletes {
+    fn is_empty(&self) -> bool {
+        self.segments.is_empty() && self.memtable.is_empty()
+    }
+
+    /// The segment bitmaps, in the shape a log record carries them.
+    fn logged_segments(&self) -> Result<Vec<SegmentDeletes>> {
+        self.segments
+            .iter()
+            .map(|(id, dv)| {
+                Ok(SegmentDeletes {
+                    segment_id: *id,
+                    bitmap: dv.to_bitmap_bytes()?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Work out which rows a deletion would actually remove.
+fn plan_deletes(
+    writer: &Writer,
+    segment_deletions: &[(SegmentId, Vec<u32>)],
+    memtable_seqnos: &[u64],
+) -> Result<PlannedDeletes> {
+    let mut planned = PlannedDeletes::default();
+
+    for (segment_id, positions) in segment_deletions {
+        let Some(entry) = writer.file.manifest().segment(*segment_id).cloned() else {
+            return Err(Error::InvalidArgument(format!(
+                "segment {segment_id} is not in this table"
+            )));
+        };
+        let mut dv = writer.deletes_for(*segment_id);
+        let before = dv.len();
+        dv.delete_all(
+            positions
+                .iter()
+                .copied()
+                .filter(|p| (*p as u64) < entry.row_count),
+        );
+        if dv.len() > before {
+            planned.count += dv.len() - before;
+            planned.segments.push((*segment_id, dv));
+        }
+    }
+
+    planned.memtable = memtable_seqnos
+        .iter()
+        .copied()
+        .filter(|seqno| !writer.memtable.is_deleted(*seqno))
+        .collect();
+
+    Ok(planned)
+}
+
+/// Apply planned deletions to the writer's in-memory state.
+///
+/// Called only after the record describing them is durable.
+fn apply_deletes(writer: &mut Writer, planned: PlannedDeletes) -> u64 {
+    let mut deleted = planned.count;
+    for (segment_id, dv) in planned.segments {
+        writer.deletes.insert(segment_id, Arc::new(dv));
+        writer.dirty_deletes.insert(segment_id);
+    }
+    deleted += writer.memtable.delete(planned.memtable);
+    deleted
 }
 
 /// Read a segment's deletions off disk.

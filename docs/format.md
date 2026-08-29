@@ -118,6 +118,21 @@ land in the log a flush is about to truncate.
 A damaged record hides every record after it, because their order is what makes
 them mean anything.
 
+## Deletes and compaction
+
+Segments never change once written, so a delete records row positions in a
+roaring bitmap rather than rewriting data. A scan applies the bitmap as a mask,
+and skips building one at all when nothing is deleted.
+
+Deleted rows still occupy their bytes. Compaction reads the live rows of the
+hollowed-out segments, writes them as one new segment, and frees the old ones.
+It reads outside the writer lock, then rechecks under it: a delete that landed
+meanwhile makes the rewrite stale, so it is abandoned rather than resurrecting
+rows the delete removed.
+
+An `UPDATE` is a delete and an insert in one log record, so a crash can never
+leave the old rows gone and the new ones missing.
+
 ## Alignment
 
 | boundary | value | reason |

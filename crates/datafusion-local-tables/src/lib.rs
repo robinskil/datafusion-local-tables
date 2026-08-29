@@ -23,9 +23,11 @@
 
 pub mod columnar_exec;
 pub mod columnar_provider;
+pub mod dml;
 pub mod pruning;
 
 pub use columnar_exec::ColumnarScanExec;
 pub use columnar_provider::{register_columnar_table, ColumnarTableProvider};
+pub use dml::{ColumnarDataSink, DmlExec};
 pub use localtables_format as format;
 pub use localtables_format::ColumnarTable;
