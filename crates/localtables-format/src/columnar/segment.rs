@@ -316,16 +316,30 @@ impl SegmentReader {
                 })
             })
             .collect::<Result<_>>()?;
+
+        // Read the metadata once for the whole batch. Reaching for it per
+        // column re-checksums and re-validates the same frame each time, which
+        // a scan pays once per column per segment for nothing.
+        let meta = self.meta()?;
+        let source = SegmentBytes::new(self.bytes.clone());
         let columns: Vec<ArrayRef> = indices
             .iter()
-            .map(|&i| self.column(i))
+            .map(|&i| {
+                let chunk = meta.columns.get(i).ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "column {i} is out of range for a {}-column segment",
+                        meta.columns.len()
+                    ))
+                })?;
+                decode_column(chunk, self.schema.field(i).data_type(), &source)
+            })
             .collect::<Result<_>>()?;
 
         let projected = Arc::new(Schema::new(fields));
         if columns.is_empty() {
             // A count-only scan projects nothing; the batch still has to carry
             // the row count.
-            let rows = self.row_count()? as usize;
+            let rows = meta.row_count.to_native() as usize;
             let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(rows));
             return RecordBatch::try_new_with_options(projected, columns, &options)
                 .map_err(Error::from);

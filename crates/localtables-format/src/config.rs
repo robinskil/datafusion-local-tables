@@ -1,5 +1,18 @@
 //! Tunables for a table handle.
 
+/// Row groups a flush aims to leave the table holding.
+///
+/// A floor on the count rather than a target: passing it means the groups grow
+/// instead. Enough that a scan has something for every thread with room to
+/// spare, and no more, because a segment is not free — it costs a mapping, a
+/// metadata frame to check and a set of zone maps, measured at roughly five
+/// microseconds each. Scanning the same 500,000 rows cut different ways, at
+/// four partitions: 317 us in 5 segments, 303 in 10, 324 in 20, 458 in 70.
+/// Eight groups puts a table in that flat region without running past it.
+///
+/// See `docs/performance.md` for the full measurement.
+pub const TARGET_ROW_GROUPS: usize = 8;
+
 /// How hard a commit pushes bytes toward the media.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Durability {
@@ -42,8 +55,18 @@ pub struct TableOptions {
     pub memtable_max_bytes: usize,
     /// Flush once the active WAL file grows past this size.
     pub wal_max_bytes: u64,
-    /// Target row count per segment row group.
+    /// Largest row group a flush will write.
+    ///
+    /// A flush aims for [`TARGET_ROW_GROUPS`] groups across the table and
+    /// clamps the result between [`TableOptions::min_row_group_rows`] and this,
+    /// so a small table is still divisible and a large one does not accumulate
+    /// metadata for row groups nobody needs.
     pub row_group_rows: usize,
+    /// Smallest row group a flush will write.
+    ///
+    /// Below this the per-segment costs — a mapping, a metadata frame, a set of
+    /// zone maps — start to outweigh what dividing the work buys.
+    pub min_row_group_rows: usize,
     /// Batch size the scan emits.
     pub scan_batch_rows: usize,
     pub durability: Durability,
@@ -63,6 +86,7 @@ impl Default for TableOptions {
             memtable_max_bytes: 64 * 1024 * 1024,
             wal_max_bytes: 256 * 1024 * 1024,
             row_group_rows: 128 * 1024,
+            min_row_group_rows: 8 * 1024,
             scan_batch_rows: 8192,
             durability: Durability::default(),
             io_backend: IoBackend::default(),
@@ -75,6 +99,22 @@ impl Default for TableOptions {
 }
 
 impl TableOptions {
+    /// The row group size to write, given how many rows the table will hold.
+    ///
+    /// Small tables get small groups so a scan can still divide them; the size
+    /// grows with the table until it reaches the maximum, after which the
+    /// number of groups grows instead.
+    pub fn row_group_size_for(&self, total_rows: u64) -> usize {
+        if self.row_group_rows == 0 {
+            return 0;
+        }
+        let even = (total_rows as usize).div_ceil(TARGET_ROW_GROUPS.max(1));
+        even.clamp(
+            self.min_row_group_rows.min(self.row_group_rows).max(1),
+            self.row_group_rows,
+        )
+    }
+
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
         self
@@ -93,5 +133,85 @@ impl TableOptions {
     pub fn with_compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options() -> TableOptions {
+        TableOptions::default()
+    }
+
+    #[test]
+    fn a_small_table_gets_the_smallest_groups() {
+        let options = options();
+        // Dividing evenly would give groups far below the floor, so the floor
+        // decides and the table simply holds fewer groups.
+        assert_eq!(
+            options.row_group_size_for(1_000),
+            options.min_row_group_rows
+        );
+        assert_eq!(options.row_group_size_for(0), options.min_row_group_rows);
+    }
+
+    #[test]
+    fn groups_grow_with_the_table() {
+        let options = options();
+        let small = options.row_group_size_for(200_000);
+        let medium = options.row_group_size_for(1_000_000);
+        assert!(
+            small < medium,
+            "a bigger table should get bigger groups: {small} then {medium}"
+        );
+        assert_eq!(medium, 1_000_000 / TARGET_ROW_GROUPS);
+        assert!(medium <= options.row_group_rows);
+    }
+
+    #[test]
+    fn growth_stops_at_the_maximum() {
+        let options = options();
+        assert_eq!(
+            options.row_group_size_for(100_000_000),
+            options.row_group_rows,
+            "past the cap the table gains groups rather than bigger ones"
+        );
+    }
+
+    #[test]
+    fn a_large_table_is_divided_into_at_least_the_target_number() {
+        let options = options();
+        for rows in [200_000u64, 1_000_000, 4_000_000] {
+            let size = options.row_group_size_for(rows);
+            let groups = (rows as usize).div_ceil(size);
+            assert!(
+                groups >= TARGET_ROW_GROUPS,
+                "{rows} rows in groups of {size} gives only {groups}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_maximum_of_zero_means_one_group() {
+        let options = TableOptions {
+            row_group_rows: 0,
+            ..TableOptions::default()
+        };
+        assert_eq!(options.row_group_size_for(1_000_000), 0);
+    }
+
+    #[test]
+    fn a_floor_above_the_cap_does_not_invert_them() {
+        let options = TableOptions {
+            row_group_rows: 1_000,
+            min_row_group_rows: 100_000,
+            ..TableOptions::default()
+        };
+        assert_eq!(
+            options.row_group_size_for(10),
+            1_000,
+            "the cap wins, so the size never exceeds what was asked for"
+        );
     }
 }

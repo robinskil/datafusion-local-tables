@@ -441,9 +441,15 @@ impl ColumnarTable {
 
         // One segment per row group, not one per flush. A segment is the unit a
         // scan hands to a partition and the unit a zone map covers, so a flush
-        // that made one enormous segment would leave a reader nothing to split
+        // that made one enormous segment would leave a reader nothing to divide
         // and nothing to prune.
-        for group in split_row_groups(frozen.batches, self.inner.options.row_group_rows) {
+        //
+        // The size is chosen from what the table will hold once this flush
+        // lands, so a small table gets small groups it can still divide and a
+        // large one gets groups near the cap rather than thousands of tiny ones.
+        let total_rows = manifest.total_rows() + frozen.rows;
+        let group_rows = self.inner.options.row_group_size_for(total_rows);
+        for group in split_row_groups(frozen.batches, group_rows) {
             self.write_segment(&writer.file, &mut manifest, &group, min_active)
                 .await?;
         }
@@ -666,10 +672,13 @@ impl ColumnarTable {
         let min_active = self.inner.registry.min_active_txn();
         let rows: u64 = live.iter().map(|b| b.num_rows() as u64).sum();
 
-        // Rewriting is bounded by the same row-group limit a flush uses, so a
-        // compaction cannot undo a table's parallelism by merging everything
-        // into one segment.
-        for group in split_row_groups(live, self.inner.options.row_group_rows) {
+        // Rewriting uses the same sizing a flush would, so a compaction cannot
+        // undo a table's divisibility by merging everything into one segment.
+        let group_rows = self
+            .inner
+            .options
+            .row_group_size_for(manifest.total_rows().max(rows));
+        for group in split_row_groups(live, group_rows) {
             self.write_segment(&writer.file, &mut manifest, &group, min_active)
                 .await?;
         }

@@ -491,3 +491,117 @@ async fn one_large_flush_still_scans_in_parallel() {
          but the flush made {segments} segment(s):\n{text}"
     );
 }
+
+/// Partitions take work from a shared queue, so the thing that could go wrong
+/// is a segment being handed out twice or skipped. Every row must appear
+/// exactly once however many partitions are pulling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn every_row_is_read_exactly_once_however_many_partitions() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = ColumnarTable::create(&dir.path().join("t.lt"), schema(), options())
+        .await
+        .unwrap();
+
+    // Deliberately uneven: a big flush, then several small ones, so the pieces
+    // of work differ in cost and a static split would leave partitions idle.
+    table.insert(&[batch(0..40_000)]).await.unwrap();
+    table.flush().await.unwrap();
+    for round in 0..7i64 {
+        let start = 40_000 + round * 300;
+        table.insert(&[batch(start..start + 300)]).await.unwrap();
+        table.flush().await.unwrap();
+    }
+    // And some rows still in memory, which are work items too.
+    table.insert(&[batch(42_100..42_500)]).await.unwrap();
+
+    let expected: Vec<i64> = (0..42_100).chain(42_100..42_500).collect();
+
+    for partitions in [1usize, 2, 3, 5, 8, 16] {
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_target_partitions(partitions),
+        );
+        ctx.register_table("t", Arc::new(ColumnarTableProvider::new(table.clone())))
+            .unwrap();
+
+        let rows = query(&ctx, "SELECT id FROM t").await;
+        assert_eq!(
+            ids(&rows),
+            expected,
+            "with {partitions} partitions, the rows read were not the rows stored"
+        );
+
+        // count(*) goes through a different path than materialising the rows.
+        assert_eq!(
+            scalar_i64(&query(&ctx, "SELECT count(*) FROM t").await) as usize,
+            expected.len(),
+            "with {partitions} partitions"
+        );
+    }
+}
+
+/// A limit is a budget shared across partitions, and so is the work queue.
+/// Together they must still stop at exactly the limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_limit_holds_while_partitions_share_the_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_table, ctx) = table(&dir, 20, 30).await;
+
+    for limit in [1usize, 7, 100, 999, 2030, 5000] {
+        let rows = query(&ctx, &format!("SELECT id FROM t LIMIT {limit}")).await;
+        assert_eq!(count(&rows), limit.min(2030), "limit {limit}");
+    }
+}
+
+/// Row groups grow with the table rather than staying at one size.
+#[tokio::test]
+async fn row_groups_grow_with_the_table() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // A small table: groups are held at the floor, so it still divides.
+    let small = ColumnarTable::create(&dir.path().join("small.lt"), schema(), options())
+        .await
+        .unwrap();
+    small.insert(&[batch(0..20_000)]).await.unwrap();
+    small.flush().await.unwrap();
+    let small_segments = small.snapshot().manifest.segments.len();
+
+    // A larger one written the same way: bigger groups, and more of them.
+    let large = ColumnarTable::create(&dir.path().join("large.lt"), schema(), options())
+        .await
+        .unwrap();
+    for chunk in (0..400_000i64).collect::<Vec<_>>().chunks(50_000) {
+        large
+            .insert(&[batch(chunk[0]..chunk[chunk.len() - 1] + 1)])
+            .await
+            .unwrap();
+    }
+    large.flush().await.unwrap();
+    let large_rows: Vec<u64> = large
+        .snapshot()
+        .manifest
+        .segments
+        .iter()
+        .map(|s| s.row_count)
+        .collect();
+    let small_rows: Vec<u64> = small
+        .snapshot()
+        .manifest
+        .segments
+        .iter()
+        .map(|s| s.row_count)
+        .collect();
+
+    assert!(
+        small_segments > 1,
+        "even 20k rows should divide: {small_rows:?}"
+    );
+    assert!(
+        large_rows.iter().max() > small_rows.iter().max(),
+        "a bigger table should use bigger row groups: {small_rows:?} then {large_rows:?}"
+    );
+    assert!(
+        large_rows.len() >= localtables_format::config::TARGET_ROW_GROUPS,
+        "and still hold enough of them to divide: {} groups",
+        large_rows.len()
+    );
+}

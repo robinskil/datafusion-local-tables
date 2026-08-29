@@ -155,8 +155,10 @@ actually reference, and `gc` to rebuild the buffers around it.
 
 ## Segments are row groups
 
-A flush produces segments bounded by `row_group_rows` (128k rows by default),
-not one segment per flush. A segment is the unit a scan hands to a partition and
+A flush produces segments sized for the table, not one segment per flush. The
+size is `total rows / TARGET_ROW_GROUPS`, clamped between `min_row_group_rows`
+and `row_group_rows`: a small table gets small groups it can still divide, and a
+large one settles at the cap and gains groups rather than bigger ones. A segment is the unit a scan hands to a partition and
 the unit a zone map covers, so a flush that made one enormous segment would
 leave a reader nothing to divide and nothing to prune — a table written in one
 go would scan on a single thread however many were available. Compaction is
@@ -169,6 +171,16 @@ sliced, and only that batch pays a copy.
 
 This is the same granularity parquet readers work at: DataFusion divides a
 parquet file by row group, and divides a local table by segment.
+
+Segments are not free, so more is not better: each costs a mapping, a metadata
+frame to verify, and a set of zone maps. `docs/performance.md` measures where
+that stops paying.
+
+A scan takes segments from a shared queue rather than being dealt a fixed share
+when the plan is built. The pieces are not equal — the last group of a flush is
+a partial one, compaction leaves uneven ones, a compressed segment costs more to
+decode than a mapped one — so a split decided before any of them is read is
+guessing.
 
 ## Deletes and compaction
 

@@ -141,29 +141,49 @@ worth having, because before it a dictionary column could not be stored at all.
 
 ## Parallel scans
 
-A segment is the unit a scan gives to a partition, and a flush produces segments
-bounded by `row_group_rows`, so a table written in one go still divides across
-threads. Scanning 500,000 rows written in a single flush:
+A segment is the unit a scan gives to a partition. Partitions take segments from
+a shared queue rather than being dealt a fixed share, so one that draws a cheap
+segment comes back for another.
+
+How many segments a table should hold is a real trade, and both sides of it are
+measurable. Scanning the same 500,000 rows cut different ways, all in one run:
+
+| segments | 1 partition | 4 partitions | 8 partitions |
+| --- | --- | --- | --- |
+| 5 | 428 µs | 317 µs | 338 µs |
+| 10 | 461 µs | **303 µs** | **301 µs** |
+| 20 | 532 µs | 324 µs | 348 µs |
+| 70 | 736 µs | 458 µs | 572 µs |
+
+A segment is not free: a mapping, a metadata frame to verify, a set of zone
+maps, about five microseconds each. Read down the one-partition column and that
+cost is plain — 428 µs to 736 µs for the same rows. Read across and the benefit
+is plain too, until there are so many segments that their overhead swamps it.
+The flat region here is five to twenty; `TARGET_ROW_GROUPS` is set to eight to
+land in it.
+
+More partitions than four buys nothing on this query, and that is not about
+segments. Fitting `total = fixed + work / threads` puts roughly 280 µs of it in
+costs that do not divide — planning, the final aggregation, spawning the tasks —
+and only about 175 µs in the scan. The scan part divides as expected; it is the
+smaller half of a query this cheap.
+
+### Uneven segments
+
+The shape a shared queue is meant for: half the rows in one segment and the rest
+spread over twenty small ones.
 
 | target partitions | time |
 | --- | --- |
-| 1 | 454 µs |
-| 2 | 369 µs |
-| 4 | **324 µs** |
-| 8 | 341 µs |
+| 1 | 531 µs |
+| 4 | **359 µs** |
+| 8 | 406 µs |
 
-It scales, but well short of linearly, and it is worth being clear why rather
-than quoting the 1.4x as though it were the whole story. Fitting
-`total = fixed + work / threads` to the first and third rows puts about 280 µs
-of this query in costs that do not divide — planning, the final aggregation,
-spawning the tasks — and only about 175 µs in the scan itself. The scan part
-does divide roughly as expected; it is simply the smaller half of a query this
-cheap. A heavier query over the same data would show the division more clearly.
-
-Eight partitions are no faster than four because there is nothing more to
-divide: 500,000 rows at the default 128k row group is four segments, and a scan
-never makes more partitions than it has segments. The same is true of a parquet
-reader, which divides a file by row group.
+It divides, but this does not establish that taking from a queue beat the fixed
+split it replaced — that would need both implementations measured side by side,
+and only one of them still exists. The argument for it is that the pieces are
+genuinely unequal, so a split fixed before any of them is read is guessing; the
+evidence here is only that the result is correct and not slower.
 
 ## Small writes
 

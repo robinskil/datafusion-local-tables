@@ -1,12 +1,12 @@
 //! The scan plan for a columnar table.
 //!
-//! Work is split into partitions when the plan is built: surviving segments go
-//! round-robin across them, and the rows still held in memory go with the
-//! first. Each partition then streams its own work, so nothing coordinates at
-//! run time beyond the shared row budget a `LIMIT` imposes.
+//! Every surviving segment, and every batch still held in memory, is one piece
+//! of work. Partitions take pieces from a shared queue rather than being handed
+//! a fixed share when the plan is built, so a partition that draws a cheap
+//! piece comes back for another instead of finishing early.
 
 use std::fmt;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
@@ -41,14 +41,49 @@ pub(crate) fn to_df_error(error: localtables_format::Error) -> DataFusionError {
     DataFusionError::External(Box::new(error))
 }
 
+/// The work a scan has left to do, shared by every partition.
+///
+/// Partitions take from this rather than being handed a fixed share when the
+/// plan is built. A static split is only as good as its guess about how long
+/// each piece takes, and the pieces are not equal: the last row group of a
+/// flush is a partial one, compaction leaves uneven ones behind, and a
+/// compressed segment costs more to decode than a mapped one. Whichever
+/// partition finishes first takes the next piece, so none of that matters.
+#[derive(Debug)]
+struct Morsels {
+    work: Vec<Work>,
+    next: AtomicUsize,
+}
+
+impl Morsels {
+    fn new(work: Vec<Work>) -> Self {
+        Self {
+            work,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    /// The next piece of work, or `None` once they are all taken.
+    fn take(&self) -> Option<&Work> {
+        let index = self.next.fetch_add(1, Ordering::Relaxed);
+        self.work.get(index)
+    }
+
+    fn len(&self) -> usize {
+        self.work.len()
+    }
+}
+
 /// A scan of one columnar table at one snapshot.
 pub struct ColumnarScanExec {
     table: ColumnarTable,
     /// Pinned for the life of the plan, so the bytes it reads stay put.
     snapshot: Arc<Snapshot>,
     projection: Option<Arc<Vec<usize>>>,
-    /// Work per partition, decided when the plan was built.
-    partitions: Vec<Vec<Work>>,
+    /// The work, taken by whichever partition is free.
+    morsels: Arc<Morsels>,
+    /// How many partitions the plan advertises.
+    partition_count: usize,
     /// Rows still to emit across all partitions, when a limit applies.
     limit: Option<usize>,
     /// Segments the zone maps ruled out. Reported in EXPLAIN, so a query that
@@ -74,27 +109,15 @@ impl ColumnarScanExec {
             None => snapshot.schema.clone(),
         };
 
-        // One partition per segment at most: splitting further would hand a
-        // partition no work, and DataFusion counts empty partitions as real.
         let batches: Vec<RecordBatch> = snapshot.memtable.as_ref().clone();
-        let work_units = segments.len() + usize::from(!batches.is_empty());
-        let partition_count = target_partitions.clamp(1, work_units.max(1));
+        let mut work: Vec<Work> = segments.into_iter().map(Work::Segment).collect();
+        work.extend(batches.into_iter().map(Work::Batch));
 
-        let mut partitions: Vec<Vec<Work>> = vec![Vec::new(); partition_count];
-        for (index, entry) in segments.into_iter().enumerate() {
-            partitions[index % partition_count].push(Work::Segment(entry));
-        }
-        if !batches.is_empty() {
-            // In-memory rows go to the partition holding the least work, so a
-            // single large memtable does not land on top of a busy partition.
-            let target = partitions
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, work)| work.len())
-                .map(|(index, _)| index)
-                .unwrap_or(0);
-            partitions[target].extend(batches.into_iter().map(Work::Batch));
-        }
+        // No more partitions than pieces of work: an extra one would find the
+        // queue empty on its first look, and DataFusion counts empty partitions
+        // as real ones.
+        let partition_count = target_partitions.clamp(1, work.len().max(1));
+        let morsels = Arc::new(Morsels::new(work));
 
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(projected_schema.clone()),
@@ -107,7 +130,8 @@ impl ColumnarScanExec {
             table,
             snapshot,
             projection: projection.map(Arc::new),
-            partitions,
+            morsels,
+            partition_count,
             limit,
             pruned_segments,
             projected_schema,
@@ -118,9 +142,9 @@ impl ColumnarScanExec {
     /// Rows the scan will return, before any filter above it.
     fn row_estimate(&self) -> u64 {
         let rows: u64 = self
-            .partitions
+            .morsels
+            .work
             .iter()
-            .flatten()
             .map(|work| match work {
                 Work::Segment(entry) => self.snapshot.live_rows_in(entry),
                 Work::Batch(batch) => batch.num_rows() as u64,
@@ -141,24 +165,18 @@ impl fmt::Debug for ColumnarScanExec {
 
 impl DisplayAs for ColumnarScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let segments: usize = self
-            .partitions
+        let segments = self
+            .morsels
+            .work
             .iter()
-            .flatten()
             .filter(|w| matches!(w, Work::Segment(_)))
             .count();
-        let in_memory: usize = self
-            .partitions
-            .iter()
-            .flatten()
-            .filter(|w| matches!(w, Work::Batch(_)))
-            .count();
+        let in_memory = self.morsels.len() - segments;
 
         write!(
             f,
             "ColumnarScanExec: segments={segments}, pruned={}, in_memory_batches={in_memory}, partitions={}",
-            self.pruned_segments,
-            self.partitions.len()
+            self.pruned_segments, self.partition_count
         )?;
         if let Some(projection) = &self.projection {
             let names: Vec<&str> = projection
@@ -209,46 +227,52 @@ impl ExecutionPlan for ColumnarScanExec {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let work = self.partitions.get(partition).cloned().ok_or_else(|| {
-            DataFusionError::Internal(format!(
+        if partition >= self.partition_count {
+            return Err(DataFusionError::Internal(format!(
                 "partition {partition} is out of range for a {}-partition scan",
-                self.partitions.len()
-            ))
-        })?;
+                self.partition_count
+            )));
+        }
 
         let table = self.table.clone();
         let snapshot = self.snapshot.clone();
         let projection = self.projection.clone();
+        let morsels = self.morsels.clone();
         // Every partition draws from one budget, so a LIMIT stops the whole
         // scan rather than each partition returning a limit's worth.
         let budget = self
             .limit
             .map(|limit| Arc::new(AtomicI64::new(limit as i64)));
 
-        let stream = stream::iter(work.into_iter().map(Ok::<Work, DataFusionError>))
-            .and_then(move |item| {
-                let table = table.clone();
-                let snapshot = snapshot.clone();
-                let projection = projection.clone();
-                async move {
-                    match item {
-                        Work::Segment(entry) => table
-                            .read_segment(&snapshot, &entry, projection.as_deref().map(|p| &p[..]))
-                            .await
-                            .map_err(to_df_error),
-                        Work::Batch(batch) => match projection.as_deref() {
-                            Some(indices) => Ok(vec![batch.project(indices)?]),
-                            None => Ok(vec![batch]),
-                        },
-                    }
-                }
-            })
-            .map_ok(|batches| stream::iter(batches.into_iter().map(Ok)))
-            .try_flatten()
-            .try_filter_map(move |batch| {
-                let budget = budget.clone();
-                async move { Ok(apply_budget(budget.as_deref(), batch)) }
-            });
+        // Each step takes the next piece of work still going, so a partition
+        // that draws a cheap segment comes straight back for another.
+        let stream = stream::try_unfold(morsels, move |morsels| {
+            let table = table.clone();
+            let snapshot = snapshot.clone();
+            let projection = projection.clone();
+            async move {
+                let Some(item) = morsels.take() else {
+                    return Ok::<_, DataFusionError>(None);
+                };
+                let batches = match item {
+                    Work::Segment(entry) => table
+                        .read_segment(&snapshot, entry, projection.as_deref().map(|p| &p[..]))
+                        .await
+                        .map_err(to_df_error)?,
+                    Work::Batch(batch) => match projection.as_deref() {
+                        Some(indices) => vec![batch.project(indices)?],
+                        None => vec![batch.clone()],
+                    },
+                };
+                Ok(Some((batches, morsels)))
+            }
+        })
+        .map_ok(|batches| stream::iter(batches.into_iter().map(Ok)))
+        .try_flatten()
+        .try_filter_map(move |batch| {
+            let budget = budget.clone();
+            async move { Ok(apply_budget(budget.as_deref(), batch)) }
+        });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.projected_schema.clone(),

@@ -336,11 +336,12 @@ fn string_group_by(c: &mut Criterion) {
     group.finish();
 }
 
-/// Does a table written in one flush actually scan faster with more threads?
+/// What does dividing a table into more segments cost, and what does it buy?
 ///
-/// A flush produces segments bounded by `row_group_rows`, which is what gives a
-/// scan something to hand to each partition. Showing `partitions=4` in a plan
-/// says the work was divided; only a timing says it was divided usefully.
+/// A segment is the unit a scan hands to a partition, so more of them means
+/// more to divide — and more per-segment work: a mapping, a metadata frame to
+/// check, a set of zone maps. Both sides are measured in one run, because
+/// timings on a shared machine drift far too much between runs to compare.
 fn parallel_scan(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(8)
@@ -349,30 +350,105 @@ fn parallel_scan(c: &mut Criterion) {
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
 
-    // One flush for the whole table, which before row groups meant one segment.
+    // The same 500k rows, written in one flush, cut into different numbers of
+    // segments by pinning the row group size.
+    let tables: Vec<(usize, ColumnarTable)> = [4usize, 8, 16, 64]
+        .into_iter()
+        .map(|wanted| {
+            let rows_per_group = (ROWS as usize).div_ceil(wanted);
+            let table = runtime.block_on(async {
+                let table = ColumnarTable::create(
+                    &dir.path().join(format!("seg{wanted}.lt")),
+                    schema(),
+                    TableOptions {
+                        durability: Durability::None,
+                        io_backend: IoBackend::Mmap,
+                        memtable_max_bytes: 512 * 1024 * 1024,
+                        row_group_rows: rows_per_group,
+                        min_row_group_rows: rows_per_group,
+                        ..TableOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+                for batch in batches() {
+                    table.insert(&[batch]).await.unwrap();
+                }
+                table.flush().await.unwrap();
+                table
+            });
+            // Batches are kept whole inside a group, so a group can close under
+            // the limit and the count land near what was asked for rather than
+            // on it. The label reports what was actually built.
+            let segments = table.snapshot().manifest.segments.len();
+            (segments, table)
+        })
+        .collect();
+
+    for threads in [1usize, 4, 8] {
+        let mut group = c.benchmark_group(format!("scan with {threads} partitions"));
+        group.throughput(Throughput::Elements(ROWS as u64));
+        for (segments, table) in &tables {
+            let ctx = SessionContext::new_with_config(
+                SessionConfig::new().with_target_partitions(threads),
+            );
+            ctx.register_table("t", Arc::new(ColumnarTableProvider::new(table.clone())))
+                .unwrap();
+            group.bench_function(format!("{segments} segments"), |b| {
+                b.iter(|| run(&ctx, &runtime, "SELECT sum(payload) FROM t"))
+            });
+        }
+        group.finish();
+    }
+}
+
+/// Uneven segments, which is what taking work from a shared queue is for.
+///
+/// One segment holding most of the rows and many holding few is the shape a
+/// static split handles worst: whichever partition draws the big one is still
+/// working when the others have finished. Taking from a queue cannot fix the
+/// big segment itself — it is one piece of work either way — but it stops the
+/// small ones from being dealt out badly on top of it.
+fn skewed_scan(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
     let table = runtime.block_on(async {
         let table = ColumnarTable::create(
-            &dir.path().join("single.lt"),
+            &dir.path().join("skew.lt"),
             schema(),
             TableOptions {
                 durability: Durability::None,
                 io_backend: IoBackend::Mmap,
                 memtable_max_bytes: 512 * 1024 * 1024,
+                // Pinned, so the shape below is what the flushes produce.
+                row_group_rows: ROWS as usize,
+                min_row_group_rows: 1,
                 ..TableOptions::default()
             },
         )
         .await
         .unwrap();
-        for batch in batches() {
-            table.insert(&[batch]).await.unwrap();
-        }
+
+        // Half the rows in one segment, the rest in twenty small ones.
+        table.insert(&[batch(0..ROWS / 2)]).await.unwrap();
         table.flush().await.unwrap();
+        let small = (ROWS / 2) / 20;
+        for i in 0..20 {
+            let start = ROWS / 2 + i * small;
+            table.insert(&[batch(start..start + small)]).await.unwrap();
+            table.flush().await.unwrap();
+        }
         table
     });
 
-    let mut group = c.benchmark_group("parallel scan (one flush)");
+    let mut group = c.benchmark_group("skewed segments");
     group.throughput(Throughput::Elements(ROWS as u64));
-    for threads in [1usize, 2, 4, 8] {
+    for threads in [1usize, 4, 8] {
         let ctx =
             SessionContext::new_with_config(SessionConfig::new().with_target_partitions(threads));
         ctx.register_table("t", Arc::new(ColumnarTableProvider::new(table.clone())))
@@ -518,6 +594,7 @@ criterion_group!(
     dictionary_group_by,
     string_group_by,
     parallel_scan,
+    skewed_scan,
     parquet_view_types,
     small_writes
 );
