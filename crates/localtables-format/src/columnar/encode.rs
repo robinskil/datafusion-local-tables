@@ -148,6 +148,11 @@ fn carries_only_its_own_rows(array: &dyn Array) -> bool {
     if array.offset() != 0 {
         return false;
     }
+    // View types need their own measure; see `view_bytes`.
+    if let Some((referenced, held)) = view_bytes(array) {
+        return held <= referenced;
+    }
+
     let data = array.to_data();
     let Ok(needed) = data.get_slice_memory_size() else {
         // A type Arrow will not measure is stored as it stands.
@@ -163,12 +168,46 @@ fn carries_only_its_own_rows(array: &dyn Array) -> bool {
     held <= needed
 }
 
+/// For a view array, the bytes its views actually reference and the bytes its
+/// data buffers hold. `None` for every other type.
+///
+/// View types are the one family the generic measure cannot judge. Arrow's
+/// `get_slice_memory_size` counts their views and not the data buffers behind
+/// them, so it reports the same figure for a whole array and for a two-row
+/// slice of it — which would have this code compacting every view array and
+/// still never noticing the one that needed it.
+fn view_bytes(array: &dyn Array) -> Option<(usize, usize)> {
+    fn measure<T: arrow_array::types::ByteViewType>(
+        array: &arrow_array::GenericByteViewArray<T>,
+    ) -> (usize, usize) {
+        (
+            array.total_buffer_bytes_used(),
+            array.data_buffers().iter().map(|b| b.len()).sum(),
+        )
+    }
+
+    match array.data_type() {
+        DataType::Utf8View => Some(measure(array.as_string_view())),
+        DataType::BinaryView => Some(measure(array.as_binary_view())),
+        _ => None,
+    }
+}
+
 /// Copy an array into fresh buffers holding only its own rows.
 ///
 /// `concat` of a single array short-circuits to a slice, which is exactly what
 /// needs undoing, so an empty array of the same type goes in front to take the
 /// general path. Returns `None` for the types `concat` does not handle.
+///
+/// View arrays take a different route: concatenating them keeps the data
+/// buffers as they are, so it cannot reclaim anything. `gc` is the operation
+/// that rebuilds them around the values the views actually point at.
 fn compact(array: &dyn Array) -> Option<ArrayRef> {
+    match array.data_type() {
+        DataType::Utf8View => return Some(Arc::new(array.as_string_view().gc())),
+        DataType::BinaryView => return Some(Arc::new(array.as_binary_view().gc())),
+        _ => {}
+    }
     let empty = arrow_array::new_empty_array(array.data_type());
     arrow_select::concat::concat(&[empty.as_ref(), array]).ok()
 }
@@ -432,6 +471,27 @@ mod tests {
             column.buffers[1].1.as_slice(),
             b"betagamma",
             "the values buffer must not carry rows this column does not hold"
+        );
+    }
+
+    #[test]
+    fn an_unsliced_view_column_is_stored_without_being_copied() {
+        use arrow_array::StringViewArray;
+
+        // Long enough that the values live in data buffers rather than inline,
+        // which is the case where a needless rebuild would cost something.
+        let values: Vec<String> = (0..2_000)
+            .map(|i| format!("a value long enough to need a data buffer, number {i}"))
+            .collect();
+        let array =
+            StringViewArray::from(values.iter().map(|v| Some(v.as_str())).collect::<Vec<_>>());
+        let source = array.to_data().buffers()[1].as_ptr();
+
+        let column = encode_column(&array, &plain_options()).unwrap();
+        assert_eq!(
+            column.buffers[1].1.as_ptr(),
+            source,
+            "a view array that owns its data buffers must not be rebuilt"
         );
     }
 

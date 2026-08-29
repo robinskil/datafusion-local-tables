@@ -847,3 +847,117 @@ async fn a_sliced_batch_does_not_store_its_parents_rows() {
         "three rows should not carry ten thousand: stored {stored} bytes"
     );
 }
+
+/// View types round-trip, including the long values that live in a separate
+/// data buffer rather than inline in the view.
+///
+/// A view array has a variable number of buffers — one of views, then as many
+/// data buffers as it needs — and each view for a long value carries the index
+/// of the buffer holding it. Storing the buffers in Arrow's order is what keeps
+/// those indices meaning what they meant.
+#[tokio::test]
+async fn view_types_round_trip() {
+    use arrow_array::{BinaryViewArray, StringViewArray};
+
+    // Twelve bytes or fewer live inline in the view; longer ones do not.
+    let short = "cat-3";
+    let long = "a string comfortably past the inline limit of a view";
+    let longer = "another long value, so the data buffer holds more than one";
+
+    let strings = StringViewArray::from(vec![
+        Some(short),
+        None,
+        Some(long),
+        Some(""),
+        Some(longer),
+        Some(short),
+    ]);
+    let binaries = BinaryViewArray::from(vec![
+        Some(&b"short"[..]),
+        Some(long.as_bytes()),
+        None,
+        Some(&b""[..]),
+        Some(longer.as_bytes()),
+        Some(&b"\x00\xff\x00"[..]),
+    ]);
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("s", DataType::Utf8View, true),
+        Field::new("b", DataType::BinaryView, true),
+        Field::new("n", DataType::Int64, false),
+    ]));
+    let original = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(strings),
+            Arc::new(binaries),
+            Arc::new(Int64Array::from(vec![1i64, 2, 3, 4, 5, 6])),
+        ],
+    )
+    .unwrap();
+
+    for compression in [Compression::None, Compression::Lz4, Compression::Zstd] {
+        for encodings in [false, true] {
+            let opts = options(compression, encodings);
+            let (_dir, reader) = round_trip(&schema, std::slice::from_ref(&original), &opts).await;
+            let read = reader.read(None).unwrap();
+
+            assert_eq!(
+                read, original,
+                "compression {compression:?}, encodings {encodings}"
+            );
+            assert_eq!(
+                read.column(0).data_type(),
+                &DataType::Utf8View,
+                "a view column must come back as a view, not converted"
+            );
+
+            // The long value is what proves the data buffers and their indices
+            // survived; a short one would pass even if they had not.
+            let strings = read
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            assert_eq!(strings.value(2), long);
+            assert_eq!(strings.value(4), longer);
+            assert!(strings.is_null(1));
+        }
+    }
+}
+
+/// A sliced view array stores only its own rows.
+///
+/// This is the case view types make awkward: slicing narrows the views buffer
+/// but leaves the data buffers whole, so a two-row slice of a large array still
+/// points into all of its data.
+#[tokio::test]
+async fn a_sliced_view_column_does_not_store_its_parents_rows() {
+    use arrow_array::StringViewArray;
+
+    // Long enough that every value lives in a data buffer rather than inline.
+    let values: Vec<String> = (0..5_000)
+        .map(|i| format!("a value long enough to need a data buffer, number {i}"))
+        .collect();
+    let whole = StringViewArray::from(values.iter().map(|v| Some(v.as_str())).collect::<Vec<_>>());
+
+    let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8View, true)]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(whole)]).unwrap();
+    let sliced = batch.slice(2_500, 2);
+
+    let opts = options(Compression::None, false);
+    let (_dir, reader) = round_trip(&schema, std::slice::from_ref(&sliced), &opts).await;
+
+    assert_eq!(reader.read(None).unwrap(), sliced);
+
+    let meta = reader.meta().unwrap();
+    let stored: u64 = meta.columns[0]
+        .buffers
+        .iter()
+        .map(|b| b.extent.len.to_native())
+        .sum();
+    assert!(
+        stored < 1_000,
+        "two rows should not carry five thousand: stored {stored} bytes"
+    );
+}

@@ -143,7 +143,15 @@ Two things are still type-specific, and deliberately:
 A sliced array is compacted before it is stored, so a batch holding three rows
 of a million-row parent stores three rows. Whether an array needs compacting is
 decided by comparing the bytes its rows need against the bytes its buffers hold
-— a comparison Arrow can make for any type, so this is generic too.
+— a comparison Arrow can make for most types, so this is generic too.
+
+View types are the exception, and the only place the encoder names a type.
+Arrow's size accounting counts a view array's views and not the data buffers
+behind them, so it reports the same figure for a whole array and for a two-row
+slice of one; and concatenating a view array keeps its data buffers as they are,
+so it cannot reclaim them either. Both are handled with the operations Arrow
+provides for the purpose: `total_buffer_bytes_used` to measure what the views
+actually reference, and `gc` to rebuild the buffers around it.
 
 ## Deletes and compaction
 
