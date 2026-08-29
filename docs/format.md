@@ -140,6 +140,47 @@ leave the old rows gone and the new ones missing.
 | Arrow buffers, frames | 64 bytes | widest SIMD register Arrow targets; also satisfies rkyv's 16 |
 | segment starts | 4096 bytes | a segment is mapped on its own |
 
+## The b-tree table
+
+A second table kind, in the same file format: same header, same two meta pages,
+same commit protocol, same free list. Only the manifest differs — a columnar
+table fills `segments`, a b-tree table fills `tree`.
+
+Rows are stored whole, ordered by a memcomparable key, so a point lookup reads
+one page per level instead of scanning.
+
+### Keys
+
+A b-tree compares keys with `memcmp`, so the byte form has to order identically
+to the value:
+
+* signed integers get their sign bit flipped, so the signed range maps onto the
+  unsigned one in order;
+* floats get their sign and magnitude rearranged, and negative zero is
+  normalised to positive zero — they are equal as numbers, and a key that told
+  them apart would let a lookup for `0.0` miss a row stored as `-0.0`;
+* strings and binary escape `0x00` as `00 FF` and end with `00 00`, so a
+  shorter key never looks larger than a longer one it prefixes;
+* every value carries a tag byte, so null sorts before everything.
+
+Multi-column keys are the concatenation, which orders by each column in turn.
+
+### The tree
+
+Copy-on-write, built bottom-up. A flush merges the pending overlay with the
+existing entries, writes fresh leaves, then fresh branches over them, and
+commits a new root. Nothing on disk is overwritten, so a reader on the old root
+keeps walking a complete tree, and there is no torn page to recover: the root
+points at one whole tree or the other.
+
+Rewriting whole levels costs more per write than editing pages in place. That
+is the trade the write-ahead log pays for: small writes go to the log and a
+sorted overlay, and only a flush touches the tree.
+
+A leaf holds up to 256 keys and a branch up to 256 children, so three levels
+hold sixteen million rows. Branch separators are the largest key beneath each
+child, which lets a range scan skip a whole subtree without reading it.
+
 ## IO backends
 
 | backend | reads | notes |

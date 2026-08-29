@@ -12,6 +12,7 @@
 //! This crate holds the format and the engine. The DataFusion providers live in
 //! the `datafusion-local-tables` crate.
 
+pub mod btree;
 pub mod columnar;
 pub mod config;
 pub mod error;

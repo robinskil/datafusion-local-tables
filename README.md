@@ -26,12 +26,19 @@ can decode one column without touching the others.
 
 ## Status
 
-Under construction. The columnar table works end to end: `SELECT`, `INSERT`,
-`DELETE` and `UPDATE` through SQL, with zone-map pruning, projection and limit
-pushdown, crash-safe commits, a write-ahead log, and compaction. Three IO
-backends: mmap (default), positional reads, and io_uring on Linux. Still to
-come: the b-tree table and nested Arrow types. See `docs/format.md` for the
-on-disk layout.
+Under construction.
+
+The **columnar table** works end to end: `SELECT`, `INSERT`, `DELETE` and
+`UPDATE` through SQL, with zone-map pruning, projection and limit pushdown,
+crash-safe commits, a write-ahead log, and compaction.
+
+The **b-tree table** works through its Rust API: point lookups, range scans,
+writes and deletes, on a copy-on-write tree with the same crash-safe commit
+protocol. Its DataFusion provider is not written yet.
+
+Three IO backends: mmap (default), positional reads, and io_uring on Linux.
+Still to come: the b-tree table's DataFusion provider, and nested Arrow types.
+See `docs/format.md` for the on-disk layout.
 
 ## Format stability
 
