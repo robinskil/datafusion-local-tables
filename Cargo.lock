@@ -2012,10 +2012,15 @@ name = "localtables-format"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "arrow-arith",
  "arrow-array",
  "arrow-buffer",
+ "arrow-cast",
+ "arrow-data",
  "arrow-ipc",
+ "arrow-ord",
  "arrow-schema",
+ "arrow-select",
  "async-trait",
  "futures",
  "io-uring",

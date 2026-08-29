@@ -17,10 +17,15 @@ uring = ["dep:io-uring"]
 testing = []
 
 [dependencies]
+arrow-arith.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true
-arrow-schema.workspace = true
+arrow-cast.workspace = true
+arrow-data.workspace = true
 arrow-ipc.workspace = true
+arrow-ord.workspace = true
+arrow-schema.workspace = true
+arrow-select.workspace = true
 
 rkyv.workspace = true
 xxhash-rust.workspace = true
