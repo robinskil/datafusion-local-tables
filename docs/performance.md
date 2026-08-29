@@ -69,12 +69,57 @@ Declaring the column `Utf8View` here does not close it, though. In one run:
 | parquet | `Utf8` read as `Utf8View` | 1.92 ms |
 | parquet | `Utf8` read as `Utf8` | 2.59 ms |
 
-Two things follow. Against a parquet reader not given view types, this crate is
-faster (2.29 against 2.59), which is consistent with the scan results. And
-storing the column as `Utf8View` makes it *slower* here rather than faster, so
-whatever parquet's reader gains from views, simply handing DataFusion a view
-array does not reproduce it. Why is not established, and this document will not
-guess again.
+Against a parquet reader not given view types, this crate is faster (2.29
+against 2.59), which is consistent with the scan results. But storing the column
+as `Utf8View` makes it slower here rather than faster, which is worth
+explaining. `tests/profile_views.rs` takes it apart.
+
+### Why storing a view column is slower
+
+Three effects, measured separately. Values are five bytes unless stated.
+
+**The column is bigger.** A view is a flat sixteen bytes per row whatever the
+value; an offset plus five bytes of data is nine. So the `Utf8View` column is
+8.0 MB against 4.5 MB — 1.78x — and every read pays for it. At forty-byte
+values the gap narrows to 1.27x, and the read cost narrows with it, which is
+what says the size is doing the work.
+
+**Validating UTF-8 costs more for the view layout.** Decoding checks what came
+off disk rather than trusting it, and for a string column that includes UTF-8.
+For `Utf8` that is one pass over a contiguous buffer; for `Utf8View` it is a
+separate check per value. Comparing types that differ in nothing else:
+
+| column type | stored bytes | decode |
+| --- | --- | --- |
+| `Utf8` | 4,500,040 | 1.14 ms |
+| `Binary` | 4,500,040 | 0.59 ms |
+| `Utf8View` | 8,000,000 | 2.47 ms |
+| `BinaryView` | 8,000,000 | **0.89 ms** |
+
+`BinaryView` and `Utf8View` hold byte-identical data and differ only in whether
+Arrow has to check it is UTF-8. `BinaryView` decodes 2.8x faster. That check is
+the whole of the cost that size does not explain.
+
+**Views do make grouping cheaper — while values stay short.** Grouping cost
+alone: 0.58 ms for `Utf8View` against 0.92 ms for `Utf8`. At forty-byte values,
+where nothing fits inline in a view any more, it reverses: 1.59 ms against
+1.13 ms.
+
+Added up, the first two exceed the third, and the view column loses. Parquet
+does not face this trade because its stored representation and the type it
+hands back are unrelated: it stores compact, dictionary-encoded pages and
+materialises views in memory, so it takes the grouping win without paying for
+sixteen bytes a row on disk. Doing the same here would mean choosing the output
+type at scan time rather than storing what the schema says — a real design
+option, and not one this crate takes today.
+
+There is also a lever on the validation cost: every buffer already carries an
+xxh3 checksum that is verified before decode, so Arrow's revalidation is
+redundant for a file this crate wrote. Skipping it with `build_unchecked` would
+recover most of that 2.8x. It is not taken, and should not be taken lightly: a
+checksum proves the bytes are the bytes that were written, not that they were
+ever valid, and unchecked construction turns a bad file into undefined
+behaviour rather than an error.
 
 ## What dictionary columns did and did not do
 
