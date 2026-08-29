@@ -12,6 +12,9 @@ builds two table shapes on that idea.
 * **B-tree table** — copy-on-write B+tree. Built for point lookups and key
   range scans.
 
+Scans divide across threads at segment granularity, which is this format's row
+group — the same unit a parquet reader divides a file by.
+
 Arrow is the in-memory model. Metadata is stored as [rkyv](https://rkyv.org)
 archives and read in place. Column data is stored as raw Arrow buffers, so a
 scan can map a segment and build a `RecordBatch` over it without copying, and

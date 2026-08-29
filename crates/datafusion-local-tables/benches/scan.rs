@@ -336,6 +336,54 @@ fn string_group_by(c: &mut Criterion) {
     group.finish();
 }
 
+/// Does a table written in one flush actually scan faster with more threads?
+///
+/// A flush produces segments bounded by `row_group_rows`, which is what gives a
+/// scan something to hand to each partition. Showing `partitions=4` in a plan
+/// says the work was divided; only a timing says it was divided usefully.
+fn parallel_scan(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    // One flush for the whole table, which before row groups meant one segment.
+    let table = runtime.block_on(async {
+        let table = ColumnarTable::create(
+            &dir.path().join("single.lt"),
+            schema(),
+            TableOptions {
+                durability: Durability::None,
+                io_backend: IoBackend::Mmap,
+                memtable_max_bytes: 512 * 1024 * 1024,
+                ..TableOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        for batch in batches() {
+            table.insert(&[batch]).await.unwrap();
+        }
+        table.flush().await.unwrap();
+        table
+    });
+
+    let mut group = c.benchmark_group("parallel scan (one flush)");
+    group.throughput(Throughput::Elements(ROWS as u64));
+    for threads in [1usize, 2, 4, 8] {
+        let ctx =
+            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(threads));
+        ctx.register_table("t", Arc::new(ColumnarTableProvider::new(table.clone())))
+            .unwrap();
+        group.bench_function(format!("{threads} partitions"), |b| {
+            b.iter(|| run(&ctx, &runtime, "SELECT sum(payload) FROM t"))
+        });
+    }
+    group.finish();
+}
+
 fn parquet_view_types(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -469,6 +517,7 @@ criterion_group!(
     scans,
     dictionary_group_by,
     string_group_by,
+    parallel_scan,
     parquet_view_types,
     small_writes
 );

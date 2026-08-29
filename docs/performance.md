@@ -139,6 +139,32 @@ as a dictionary is not a way to make a group by faster — it is a way to make t
 file smaller. The theory it was added on was wrong; the capability is still
 worth having, because before it a dictionary column could not be stored at all.
 
+## Parallel scans
+
+A segment is the unit a scan gives to a partition, and a flush produces segments
+bounded by `row_group_rows`, so a table written in one go still divides across
+threads. Scanning 500,000 rows written in a single flush:
+
+| target partitions | time |
+| --- | --- |
+| 1 | 454 µs |
+| 2 | 369 µs |
+| 4 | **324 µs** |
+| 8 | 341 µs |
+
+It scales, but well short of linearly, and it is worth being clear why rather
+than quoting the 1.4x as though it were the whole story. Fitting
+`total = fixed + work / threads` to the first and third rows puts about 280 µs
+of this query in costs that do not divide — planning, the final aggregation,
+spawning the tasks — and only about 175 µs in the scan itself. The scan part
+does divide roughly as expected; it is simply the smaller half of a query this
+cheap. A heavier query over the same data would show the division more clearly.
+
+Eight partitions are no faster than four because there is nothing more to
+divide: 500,000 rows at the default 128k row group is four segments, and a scan
+never makes more partitions than it has segments. The same is true of a parquet
+reader, which divides a file by row group.
+
 ## Small writes
 
 `small insert/100 rows` measures a hundred separate one-row inserts, each

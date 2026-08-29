@@ -450,3 +450,44 @@ fn plan_text(batches: &[RecordBatch]) -> String {
     }
     out
 }
+
+/// A table written in one flush should still scan in parallel.
+///
+/// Parquet splits a single file by row group; a segment is this format's row
+/// group, so a flush that makes one enormous segment leaves nothing to split.
+#[tokio::test]
+async fn one_large_flush_still_scans_in_parallel() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = ColumnarTable::create(&dir.path().join("t.lt"), schema(), options())
+        .await
+        .unwrap();
+
+    // One flush, well past the row-group limit.
+    for chunk in (0..500_000i64).collect::<Vec<_>>().chunks(50_000) {
+        table
+            .insert(&[batch(chunk[0]..chunk[chunk.len() - 1] + 1)])
+            .await
+            .unwrap();
+    }
+    table.flush().await.unwrap();
+
+    let segments = table.snapshot().manifest.segments.len();
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+    ctx.register_table("t", Arc::new(ColumnarTableProvider::new(table)))
+        .unwrap();
+
+    let plan = ctx
+        .sql("EXPLAIN SELECT sum(id) FROM t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let text = plan_text(&plan);
+
+    assert!(
+        text.contains("partitions=4"),
+        "500k rows should split across the four target partitions, \
+         but the flush made {segments} segment(s):\n{text}"
+    );
+}

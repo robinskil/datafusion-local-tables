@@ -153,6 +153,23 @@ so it cannot reclaim them either. Both are handled with the operations Arrow
 provides for the purpose: `total_buffer_bytes_used` to measure what the views
 actually reference, and `gc` to rebuild the buffers around it.
 
+## Segments are row groups
+
+A flush produces segments bounded by `row_group_rows` (128k rows by default),
+not one segment per flush. A segment is the unit a scan hands to a partition and
+the unit a zone map covers, so a flush that made one enormous segment would
+leave a reader nothing to divide and nothing to prune — a table written in one
+go would scan on a single thread however many were available. Compaction is
+bounded the same way, so rewriting cannot undo it.
+
+Batches are kept whole inside a group wherever they fit, because an unsliced
+batch is stored straight from Arrow's buffers with nothing copied; a group
+closes early rather than slicing one. Only a batch larger than a whole group is
+sliced, and only that batch pays a copy.
+
+This is the same granularity parquet readers work at: DataFusion divides a
+parquet file by row group, and divides a local table by segment.
+
 ## Deletes and compaction
 
 Segments never change once written, so a delete records row positions in a

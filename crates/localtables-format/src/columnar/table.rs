@@ -439,30 +439,13 @@ impl ColumnarTable {
         manifest.next_seqno = frozen.next_seqno.max(manifest.next_seqno);
         let min_active = self.inner.registry.min_active_txn();
 
-        if !frozen.is_empty() {
-            let segment_id = manifest.next_segment_id;
-            let built = build_segment(
-                segment_id,
-                &self.inner.schema,
-                self.inner.schema_fingerprint,
-                &frozen.batches,
-                &self.inner.options,
-            )?;
-            let data = writer
-                .file
-                .write_allocated(&mut manifest, &built.bytes, SEGMENT_ALIGN, min_active)
+        // One segment per row group, not one per flush. A segment is the unit a
+        // scan hands to a partition and the unit a zone map covers, so a flush
+        // that made one enormous segment would leave a reader nothing to split
+        // and nothing to prune.
+        for group in split_row_groups(frozen.batches, self.inner.options.row_group_rows) {
+            self.write_segment(&writer.file, &mut manifest, &group, min_active)
                 .await?;
-            let (_, meta) = built.placed(data.offset);
-
-            manifest.next_segment_id += 1;
-            manifest.segments.push(SegmentEntry {
-                segment_id,
-                data,
-                meta,
-                row_count: built.row_count,
-                deleted_count: 0,
-                deletes: None,
-            });
         }
 
         for segment_id in dirty {
@@ -500,6 +483,44 @@ impl ColumnarTable {
         // The retired log's records are now inside the file.
         writer.wal.truncate(retired)?;
         Ok(frozen.rows)
+    }
+
+    /// Build one segment from these batches and record it in the manifest.
+    async fn write_segment(
+        &self,
+        file: &TableFile,
+        manifest: &mut Manifest,
+        batches: &[RecordBatch],
+        min_active_txn: u64,
+    ) -> Result<u64> {
+        let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        if rows == 0 {
+            return Ok(0);
+        }
+
+        let segment_id = manifest.next_segment_id;
+        let built = build_segment(
+            segment_id,
+            &self.inner.schema,
+            self.inner.schema_fingerprint,
+            batches,
+            &self.inner.options,
+        )?;
+        let data = file
+            .write_allocated(manifest, &built.bytes, SEGMENT_ALIGN, min_active_txn)
+            .await?;
+        let (_, meta) = built.placed(data.offset);
+
+        manifest.next_segment_id += 1;
+        manifest.segments.push(SegmentEntry {
+            segment_id,
+            data,
+            meta,
+            row_count: built.row_count,
+            deleted_count: 0,
+            deletes: None,
+        });
+        Ok(built.row_count)
     }
 
     /// True when the memtable or the log has grown past its limit.
@@ -645,30 +666,12 @@ impl ColumnarTable {
         let min_active = self.inner.registry.min_active_txn();
         let rows: u64 = live.iter().map(|b| b.num_rows() as u64).sum();
 
-        if rows > 0 {
-            let segment_id = manifest.next_segment_id;
-            let built = build_segment(
-                segment_id,
-                &self.inner.schema,
-                self.inner.schema_fingerprint,
-                &live,
-                &self.inner.options,
-            )?;
-            let data = writer
-                .file
-                .write_allocated(&mut manifest, &built.bytes, SEGMENT_ALIGN, min_active)
+        // Rewriting is bounded by the same row-group limit a flush uses, so a
+        // compaction cannot undo a table's parallelism by merging everything
+        // into one segment.
+        for group in split_row_groups(live, self.inner.options.row_group_rows) {
+            self.write_segment(&writer.file, &mut manifest, &group, min_active)
                 .await?;
-            let (_, meta) = built.placed(data.offset);
-
-            manifest.next_segment_id += 1;
-            manifest.segments.push(SegmentEntry {
-                segment_id,
-                data,
-                meta,
-                row_count: built.row_count,
-                deleted_count: 0,
-                deletes: None,
-            });
         }
 
         // The rewritten segments and their bitmaps are garbage as of this
@@ -931,6 +934,57 @@ fn build_snapshot(writer: &Writer) -> Result<Arc<Snapshot>> {
     }))
 }
 
+/// Group batches into row groups of at most `max_rows` rows each.
+///
+/// Whole batches are kept together where they fit, because a batch that is not
+/// sliced is stored straight from Arrow's buffers with nothing copied. A single
+/// batch larger than the limit is sliced, which costs a copy for that batch
+/// alone.
+///
+/// A limit of zero means one group, however large.
+fn split_row_groups(batches: Vec<RecordBatch>, max_rows: usize) -> Vec<Vec<RecordBatch>> {
+    if max_rows == 0 {
+        return if batches.is_empty() {
+            Vec::new()
+        } else {
+            vec![batches]
+        };
+    }
+
+    let mut groups: Vec<Vec<RecordBatch>> = Vec::new();
+    let mut current: Vec<RecordBatch> = Vec::new();
+    let mut rows = 0usize;
+
+    for batch in batches {
+        let mut batch = batch;
+        // Close the open group rather than overfill it, so whole batches stay
+        // whole and only an oversized one gets sliced below.
+        if rows > 0 && batch.num_rows() > max_rows - rows {
+            groups.push(std::mem::take(&mut current));
+            rows = 0;
+        }
+        while batch.num_rows() > max_rows {
+            let head = batch.slice(0, max_rows);
+            batch = batch.slice(max_rows, batch.num_rows() - max_rows);
+            groups.push(vec![head]);
+        }
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        rows += batch.num_rows();
+        current.push(batch);
+        if rows >= max_rows {
+            groups.push(std::mem::take(&mut current));
+            rows = 0;
+        }
+    }
+
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
 /// Cut a batch into pieces of at most `rows` rows.
 fn slice_batches(batch: RecordBatch, rows: usize) -> Vec<RecordBatch> {
     if batch.num_rows() == 0 {
@@ -1009,6 +1063,89 @@ mod tests {
     async fn read(table: &ColumnarTable) -> Vec<i32> {
         let snapshot = table.snapshot();
         ids(&table.scan(&snapshot, None).await.unwrap())
+    }
+
+    /// Rows in the groups, in order, so nothing is lost or reordered.
+    fn grouped_ids(groups: &[Vec<RecordBatch>]) -> Vec<Vec<i32>> {
+        groups
+            .iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .flat_map(|b| {
+                        b.column(0)
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn splitting_nothing_gives_no_groups() {
+        assert!(split_row_groups(Vec::new(), 100).is_empty());
+        assert!(split_row_groups(Vec::new(), 0).is_empty());
+    }
+
+    #[test]
+    fn a_limit_of_zero_means_one_group() {
+        let groups = split_row_groups(vec![batch(&[1, 2]), batch(&[3])], 0);
+        assert_eq!(grouped_ids(&groups), vec![vec![1, 2, 3]]);
+    }
+
+    #[test]
+    fn batches_that_fit_stay_whole_and_together() {
+        let groups = split_row_groups(vec![batch(&[1, 2]), batch(&[3, 4])], 10);
+        assert_eq!(
+            grouped_ids(&groups),
+            vec![vec![1, 2, 3, 4]],
+            "nothing needs slicing, so nothing is copied"
+        );
+    }
+
+    #[test]
+    fn a_group_closes_rather_than_overfilling() {
+        // Three batches of two, limit three: the second cannot fit in the first
+        // group without slicing, so the group closes at two instead.
+        let groups = split_row_groups(vec![batch(&[1, 2]), batch(&[3, 4]), batch(&[5, 6])], 3);
+        assert_eq!(
+            grouped_ids(&groups),
+            vec![vec![1, 2], vec![3, 4], vec![5, 6]]
+        );
+        assert!(groups
+            .iter()
+            .all(|g| g.iter().map(|b| b.num_rows()).sum::<usize>() <= 3));
+    }
+
+    #[test]
+    fn an_exact_multiple_splits_evenly() {
+        let groups = split_row_groups(vec![batch(&[1, 2]), batch(&[3, 4])], 2);
+        assert_eq!(grouped_ids(&groups), vec![vec![1, 2], vec![3, 4]]);
+    }
+
+    #[test]
+    fn a_batch_larger_than_a_group_is_sliced() {
+        let groups = split_row_groups(vec![batch(&[1, 2, 3, 4, 5])], 2);
+        assert_eq!(grouped_ids(&groups), vec![vec![1, 2], vec![3, 4], vec![5]]);
+    }
+
+    #[test]
+    fn splitting_never_loses_or_reorders_a_row() {
+        let rows: Vec<i32> = (0..97).collect();
+        for limit in [1usize, 2, 5, 10, 96, 97, 98, 1000] {
+            let batches = rows.chunks(7).map(batch).collect::<Vec<_>>();
+            let groups = split_row_groups(batches, limit);
+            let flat: Vec<i32> = grouped_ids(&groups).into_iter().flatten().collect();
+            assert_eq!(flat, rows, "limit {limit}");
+            for group in &groups {
+                let count: usize = group.iter().map(|b| b.num_rows()).sum();
+                assert!(count <= limit, "limit {limit}: a group held {count}");
+            }
+        }
     }
 
     #[tokio::test]
