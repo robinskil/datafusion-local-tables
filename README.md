@@ -90,10 +90,10 @@ through the same DataFusion session, so what is measured is the storage layer
 rather than the query engine.
 
 Scans come out about twice as fast as parquet, which is the zero-copy read path
-doing what it exists for. Group-by on a low-cardinality string column is slower,
-because parquet's reader hands DataFusion a dictionary array and this crate
-hands it expanded strings. See `docs/performance.md` for the numbers and what
-they mean.
+doing what it exists for. Group-by on a string column is slower, because
+DataFusion's parquet reader turns the column into `Utf8View` and this crate
+returns the type the schema declares. See `docs/performance.md` for the numbers
+and what they do and do not establish.
 
 ## Format stability
 

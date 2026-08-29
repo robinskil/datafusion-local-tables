@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Float64Array, Int64Array, StringArray};
+use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
@@ -244,6 +244,147 @@ fn dictionary_group_by(c: &mut Criterion) {
     group.finish();
 }
 
+/// Is parquet's advantage on a string group by about the storage, or about the
+/// type DataFusion's parquet reader hands back?
+///
+/// `schema_force_view_types` defaults on, so that reader turns a `Utf8` column
+/// into `Utf8View`, and a short string lives inline in a view rather than
+/// behind an offset. This measures the same file read both ways, which is the
+/// only way to tell the two explanations apart.
+/// The string group by, with the column declared three ways.
+///
+/// Parquet's reader turns a `Utf8` column into `Utf8View`, which is where its
+/// advantage on this query comes from. The format stores whatever Arrow type
+/// the schema declares, so the same column can simply be declared `Utf8View`
+/// and never converted at all. This measures whether that closes the gap.
+fn string_group_by(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    let ctx = runtime.block_on(async {
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+
+        for (name, string_type) in [
+            ("utf8_local", DataType::Utf8),
+            ("view_local", DataType::Utf8View),
+        ] {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("category", string_type.clone(), false),
+            ]));
+            let table = ColumnarTable::create(
+                &dir.path().join(format!("{name}.lt")),
+                schema.clone(),
+                TableOptions {
+                    durability: Durability::None,
+                    io_backend: IoBackend::Mmap,
+                    memtable_max_bytes: 64 * 1024 * 1024,
+                    // Re-encoding a column only to expand it again on read is
+                    // exactly what this measurement is about avoiding.
+                    dictionary_encoding: false,
+                    rle_encoding: false,
+                    ..TableOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            for segment in 0..ROWS / ROWS_PER_SEGMENT {
+                let start = segment * ROWS_PER_SEGMENT;
+                let ids: Vec<i64> = (start..start + ROWS_PER_SEGMENT).collect();
+                let categories: Vec<String> =
+                    ids.iter().map(|i| format!("cat-{}", i % 8)).collect();
+                let plain = StringArray::from(categories);
+                let column: ArrayRef = if string_type == DataType::Utf8View {
+                    arrow::compute::cast(&plain, &DataType::Utf8View).unwrap()
+                } else {
+                    Arc::new(plain)
+                };
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int64Array::from(ids)), column],
+                )
+                .unwrap();
+                table.insert(&[batch]).await.unwrap();
+                table.flush().await.unwrap();
+            }
+            ctx.register_table(name, Arc::new(ColumnarTableProvider::new(table)))
+                .unwrap();
+        }
+
+        let path = build_parquet(dir.path());
+        ctx.register_parquet(
+            "pq",
+            path.to_str().unwrap(),
+            datafusion::prelude::ParquetReadOptions::default(),
+        )
+        .await
+        .unwrap();
+        ctx
+    });
+
+    let mut group = c.benchmark_group("string group by");
+    group.throughput(Throughput::Elements(ROWS as u64));
+    for table in ["utf8_local", "view_local", "pq"] {
+        let sql = format!("SELECT category, count(*) FROM {table} GROUP BY category");
+        group.bench_function(table, |b| b.iter(|| run(&ctx, &runtime, &sql)));
+    }
+    group.finish();
+}
+
+fn parquet_view_types(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = build_parquet(dir.path());
+
+    let with_views = runtime.block_on(async {
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+        ctx.register_parquet(
+            "pq",
+            path.to_str().unwrap(),
+            datafusion::prelude::ParquetReadOptions::default(),
+        )
+        .await
+        .unwrap();
+        ctx
+    });
+
+    let without_views = runtime.block_on(async {
+        let mut config = SessionConfig::new().with_target_partitions(4);
+        config
+            .options_mut()
+            .execution
+            .parquet
+            .schema_force_view_types = false;
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_parquet(
+            "pq",
+            path.to_str().unwrap(),
+            datafusion::prelude::ParquetReadOptions::default(),
+        )
+        .await
+        .unwrap();
+        ctx
+    });
+
+    let sql = "SELECT category, count(*) FROM pq GROUP BY category";
+    let mut group = c.benchmark_group("parquet string group by");
+    group.throughput(Throughput::Elements(ROWS as u64));
+    group.bench_function("utf8view (default)", |b| {
+        b.iter(|| run(&with_views, &runtime, sql))
+    });
+    group.bench_function("utf8", |b| b.iter(|| run(&without_views, &runtime, sql)));
+    group.finish();
+}
+
 fn scans(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -323,5 +464,12 @@ fn small_writes(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, scans, dictionary_group_by, small_writes);
+criterion_group!(
+    benches,
+    scans,
+    dictionary_group_by,
+    string_group_by,
+    parquet_view_types,
+    small_writes
+);
 criterion_main!(benches);
