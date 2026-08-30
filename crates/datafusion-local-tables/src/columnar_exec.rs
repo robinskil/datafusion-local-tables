@@ -17,12 +17,19 @@ use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use futures::stream::{self, TryStreamExt};
 
+use datafusion::physical_optimizer::pruning::PruningPredicate;
+
+use crate::pruning::PageStatistics;
+use localtables_format::columnar::segment::SegmentReader;
 use localtables_format::columnar::table::ColumnarTable;
 use localtables_format::layout::manifest::SegmentEntry;
 use localtables_format::Snapshot;
@@ -74,6 +81,91 @@ impl Morsels {
     }
 }
 
+/// What a scan tests each page against.
+#[derive(Debug, Default)]
+pub struct PageFilters {
+    predicates: Vec<Arc<PruningPredicate>>,
+    /// Columns the predicates mention, so a scan reads only those bounds.
+    columns: Vec<usize>,
+}
+
+impl PageFilters {
+    pub fn new(predicates: Vec<Arc<PruningPredicate>>, columns: Vec<usize>) -> Self {
+        Self {
+            predicates,
+            columns,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.predicates.is_empty() || self.columns.is_empty()
+    }
+
+    /// Which pages of a segment are worth handing on.
+    ///
+    /// `None` means all of them, which is the answer whenever the segment has
+    /// no page bounds, the predicates mention nothing it records, or anything
+    /// at all goes wrong. Pruning is an optimisation: a failure here costs a
+    /// read and never a row.
+    fn keep_pages(&self, schema: &SchemaRef, reader: &SegmentReader) -> Option<Vec<bool>> {
+        if self.is_empty() {
+            return None;
+        }
+        let page_rows = reader.page_rows().ok()?;
+        if page_rows == 0 {
+            return None;
+        }
+        let rows = reader.row_count().ok()?;
+        let pages = rows.div_ceil(page_rows) as usize;
+        let sizes: Vec<u64> = (0..pages)
+            .map(|page| page_rows.min(rows - page as u64 * page_rows))
+            .collect();
+
+        let mut columns = vec![None; schema.fields().len()];
+        let mut any = false;
+        for &index in &self.columns {
+            if let Ok(Some(zones)) = reader.page_zones(index) {
+                if zones.len() == pages {
+                    columns[index] = Some(zones);
+                    any = true;
+                }
+            }
+        }
+        if !any {
+            return None;
+        }
+
+        let statistics = PageStatistics::new(schema.clone(), columns, sizes);
+        let mut keep = vec![true; pages];
+        let mut ruled_out = false;
+        for predicate in &self.predicates {
+            let Ok(verdicts) = predicate.prune(&statistics) else {
+                continue;
+            };
+            if verdicts.len() != pages {
+                continue;
+            }
+            for (slot, verdict) in keep.iter_mut().zip(verdicts) {
+                if !verdict {
+                    ruled_out = true;
+                }
+                *slot &= verdict;
+            }
+        }
+        ruled_out.then_some(keep)
+    }
+}
+
+/// What pruning settled when the plan was built, and what it left to the scan.
+#[derive(Debug, Default)]
+pub struct Pruning {
+    /// Segments the zone maps ruled out. Reported in EXPLAIN, so a query that
+    /// prunes nothing is visible rather than merely slow.
+    pub segments_pruned: usize,
+    /// Tested against each surviving segment's page bounds as it is read.
+    pub pages: PageFilters,
+}
+
 /// A scan of one columnar table at one snapshot.
 pub struct ColumnarScanExec {
     table: ColumnarTable,
@@ -86,11 +178,20 @@ pub struct ColumnarScanExec {
     partition_count: usize,
     /// Rows still to emit across all partitions, when a limit applies.
     limit: Option<usize>,
-    /// Segments the zone maps ruled out. Reported in EXPLAIN, so a query that
-    /// prunes nothing is visible rather than merely slow.
-    pruned_segments: usize,
+    /// What pruning settled, and what it left for the scan to settle per page.
+    ///
+    /// Segment pruning happened when the plan was built. Page pruning has to
+    /// happen here, because it depends on bounds stored inside a segment that
+    /// only a reader of that segment has.
+    pruning: Arc<Pruning>,
     projected_schema: SchemaRef,
     properties: Arc<PlanProperties>,
+    /// Rows handed upward and pages skipped, for `EXPLAIN ANALYZE`.
+    ///
+    /// Segment pruning shows in `EXPLAIN` because it is settled when the plan
+    /// is built. Page pruning is settled while the scan runs, so the only place
+    /// it can show is here.
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl ColumnarScanExec {
@@ -102,7 +203,7 @@ impl ColumnarScanExec {
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
         target_partitions: usize,
-        pruned_segments: usize,
+        pruning: Arc<Pruning>,
     ) -> Result<Self> {
         let projected_schema = match &projection {
             Some(indices) => Arc::new(snapshot.schema.project(indices)?),
@@ -133,9 +234,10 @@ impl ColumnarScanExec {
             morsels,
             partition_count,
             limit,
-            pruned_segments,
+            pruning,
             projected_schema,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 
@@ -176,7 +278,7 @@ impl DisplayAs for ColumnarScanExec {
         write!(
             f,
             "ColumnarScanExec: segments={segments}, pruned={}, in_memory_batches={in_memory}, partitions={}",
-            self.pruned_segments, self.partition_count
+            self.pruning.segments_pruned, self.partition_count
         )?;
         if let Some(projection) = &self.projection {
             let names: Vec<&str> = projection
@@ -195,6 +297,15 @@ impl DisplayAs for ColumnarScanExec {
 impl ExecutionPlan for ColumnarScanExec {
     fn name(&self) -> &str {
         "ColumnarScanExec"
+    }
+
+    /// Rows handed upward and pages skipped.
+    ///
+    /// Segment pruning shows in `EXPLAIN`, because it is settled when the plan
+    /// is built. Page pruning is settled while the scan runs, so `EXPLAIN
+    /// ANALYZE` is the only place it can show.
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -238,6 +349,10 @@ impl ExecutionPlan for ColumnarScanExec {
         let snapshot = self.snapshot.clone();
         let projection = self.projection.clone();
         let morsels = self.morsels.clone();
+        let pruning = self.pruning.clone();
+        let table_schema = self.table.schema();
+        let baseline = BaselineMetrics::new(&self.metrics, partition);
+        let pages_pruned = MetricBuilder::new(&self.metrics).counter("pages_pruned", partition);
         // Every partition draws from one budget, so a LIMIT stops the whole
         // scan rather than each partition returning a limit's worth.
         let budget = self
@@ -250,15 +365,40 @@ impl ExecutionPlan for ColumnarScanExec {
             let table = table.clone();
             let snapshot = snapshot.clone();
             let projection = projection.clone();
+            let pruning = pruning.clone();
+            let table_schema = table_schema.clone();
+            let pages_pruned = pages_pruned.clone();
             async move {
                 let Some(item) = morsels.take() else {
                     return Ok::<_, DataFusionError>(None);
                 };
                 let batches = match item {
-                    Work::Segment(entry) => table
-                        .read_segment(&snapshot, entry, projection.as_deref().map(|p| &p[..]))
-                        .await
-                        .map_err(to_df_error)?,
+                    Work::Segment(entry) => {
+                        // The segment is opened once: the bounds that decide
+                        // which pages to keep and the bytes those pages hold
+                        // come from the same reader.
+                        let keep = match pruning.pages.is_empty() {
+                            true => None,
+                            false => {
+                                let reader =
+                                    table.segment_reader(entry).await.map_err(to_df_error)?;
+                                let keep = pruning.pages.keep_pages(&table_schema, &reader);
+                                if let Some(keep) = &keep {
+                                    pages_pruned.add(keep.iter().filter(|k| !**k).count());
+                                }
+                                keep
+                            }
+                        };
+                        table
+                            .read_segment_pages(
+                                &snapshot,
+                                entry,
+                                projection.as_deref().map(|p| &p[..]),
+                                keep.as_deref(),
+                            )
+                            .await
+                            .map_err(to_df_error)?
+                    }
                     Work::Batch(batch) => match projection.as_deref() {
                         Some(indices) => vec![batch.project(indices)?],
                         None => vec![batch.clone()],
@@ -272,7 +412,8 @@ impl ExecutionPlan for ColumnarScanExec {
         .try_filter_map(move |batch| {
             let budget = budget.clone();
             async move { Ok(apply_budget(budget.as_deref(), batch)) }
-        });
+        })
+        .inspect_ok(move |batch: &RecordBatch| baseline.record_output(batch.num_rows()));
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.projected_schema.clone(),

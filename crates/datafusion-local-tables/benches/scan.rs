@@ -671,6 +671,104 @@ fn scattered_point_lookup(c: &mut Criterion) {
 
 
 
+
+/// A point lookup with nothing but page bounds to prune with.
+///
+/// The whole table is one segment, so its zone map rules nothing out and every
+/// row would otherwise be handed to the filter above. That is the regime page
+/// bounds exist for. Parquet's own page index does the same job, so it is
+/// measured with the feature on and off too.
+fn page_pruning(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let build = |name: &'static str, page_rows: usize, re_encode: bool| {
+        let path = dir.path().join(format!("{name}.lt"));
+        runtime.block_on(async move {
+            let table = ColumnarTable::create(
+                &path,
+                schema(),
+                TableOptions {
+                    durability: Durability::None,
+                    io_backend: IoBackend::Mmap,
+                    memtable_max_bytes: 512 * 1024 * 1024,
+                    // One segment holding everything.
+                    min_row_group_rows: ROWS as usize,
+                    row_group_rows: ROWS as usize,
+                    page_rows,
+                    dictionary_encoding: re_encode,
+                    rle_encoding: re_encode,
+                    ..TableOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            for batch in batches() {
+                table.insert(&[batch]).await.unwrap();
+            }
+            table.flush().await.unwrap();
+            table
+        })
+    };
+
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+    // With and without page bounds, and with and without the encodings that
+    // make a column cost something to decode. A zero-copy column is nearly free
+    // to build whether or not its rows are wanted; a dictionary column is
+    // expanded for the whole segment before any of it is sliced.
+    for (name, page_rows, re_encode) in [
+        ("no_pages", 0, true),
+        ("pages", 8 * 1024, true),
+        ("no_pages_plain", 0, false),
+        ("pages_plain", 8 * 1024, false),
+    ] {
+        ctx.register_table(
+            name,
+            Arc::new(ColumnarTableProvider::new(build(name, page_rows, re_encode))),
+        )
+        .unwrap();
+    }
+
+    for (name, index) in [("pq", false), ("pq_index", true)] {
+        let path = dir.path().join(format!("{name}.parquet"));
+        let file = std::fs::File::create(&path).unwrap();
+        let properties = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(ROWS as usize))
+            .set_statistics_enabled(if index {
+                parquet::file::properties::EnabledStatistics::Page
+            } else {
+                parquet::file::properties::EnabledStatistics::Chunk
+            })
+            .build();
+        let mut writer = ArrowWriter::try_new(file, schema(), Some(properties)).unwrap();
+        for batch in batches() {
+            writer.write(&batch).unwrap();
+        }
+        writer.close().unwrap();
+        runtime
+            .block_on(ctx.register_parquet(
+                name,
+                path.to_str().unwrap(),
+                datafusion::prelude::ParquetReadOptions::default(),
+            ))
+            .unwrap();
+    }
+
+    let mut group = c.benchmark_group("point lookup inside a segment");
+    for table in [
+        "no_pages",
+        "pages",
+        "no_pages_plain",
+        "pages_plain",
+        "pq",
+        "pq_index",
+    ] {
+        let sql = format!("SELECT * FROM {table} WHERE id = 372145");
+        group.bench_function(table, |b| b.iter(|| run(&ctx, &runtime, &sql)));
+    }
+    group.finish();
+}
+
 /// A query on a column the insert order does not follow.
 ///
 /// Rows arrive ordered by `y`, so a zone map prunes `y` perfectly and `x` not
@@ -909,6 +1007,7 @@ criterion_group!(
     skewed_scan,
     parquet_view_types,
     scattered_point_lookup,
+    page_pruning,
     substring_search,
     clustered_layout,
     small_writes

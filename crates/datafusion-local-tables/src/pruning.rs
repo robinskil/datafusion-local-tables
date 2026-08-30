@@ -111,6 +111,99 @@ fn find(filters: &[(usize, BloomFilter)], index: usize) -> Option<&BloomFilter> 
         .map(|(_, filter)| filter)
 }
 
+/// Bounds for the pages inside one segment, in the shape pruning wants.
+///
+/// The same reasoning as [`SegmentStatistics`], one level down: there a
+/// container is a segment and the answer is whether to read it, here a
+/// container is a row range inside one and the answer is whether to hand it on.
+/// A page with no bounds contributes a null, which reads as "could match".
+#[derive(Debug)]
+pub struct PageStatistics {
+    schema: SchemaRef,
+    /// Bounds per column, each an entry per page. Absent where a column has no
+    /// page bounds at all.
+    columns: Vec<Option<Vec<ZoneMap>>>,
+    pages: usize,
+    /// Rows in each page, the last one usually shorter.
+    rows: Vec<u64>,
+}
+
+impl PageStatistics {
+    pub fn new(schema: SchemaRef, columns: Vec<Option<Vec<ZoneMap>>>, rows: Vec<u64>) -> Self {
+        Self {
+            pages: rows.len(),
+            schema,
+            columns,
+            rows,
+        }
+    }
+
+    fn zones(&self, column: &Column) -> Option<(&[ZoneMap], &DataType)> {
+        let index = self.schema.index_of(&column.name).ok()?;
+        let zones = self.columns.get(index)?.as_deref()?;
+        if zones.len() != self.pages {
+            return None;
+        }
+        Some((zones, self.schema.field(index).data_type()))
+    }
+
+    fn bounds(
+        &self,
+        column: &Column,
+        pick: impl Fn(&ZoneMap, &DataType) -> Option<ArrayRef>,
+    ) -> Option<ArrayRef> {
+        let (zones, data_type) = self.zones(column)?;
+
+        let mut any_known = false;
+        let mut parts: Vec<ArrayRef> = Vec::with_capacity(zones.len());
+        for zone in zones {
+            match pick(zone, data_type) {
+                Some(array) => {
+                    any_known = true;
+                    parts.push(array);
+                }
+                None => parts.push(arrow::array::new_null_array(data_type, 1)),
+            }
+        }
+        if !any_known {
+            return None;
+        }
+        let refs: Vec<&dyn arrow::array::Array> = parts.iter().map(|a| a.as_ref()).collect();
+        arrow::compute::concat(&refs).ok()
+    }
+}
+
+impl PruningStatistics for PageStatistics {
+    fn min_values(&self, column: &Column) -> Option<ArrayRef> {
+        self.bounds(column, |zone, data_type| zone.min_array(data_type))
+    }
+
+    fn max_values(&self, column: &Column) -> Option<ArrayRef> {
+        self.bounds(column, |zone, data_type| zone.max_array(data_type))
+    }
+
+    fn num_containers(&self) -> usize {
+        self.pages
+    }
+
+    fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
+        let (zones, _) = self.zones(column)?;
+        Some(Arc::new(UInt64Array::from(
+            zones.iter().map(|zone| zone.null_count).collect::<Vec<u64>>(),
+        )))
+    }
+
+    fn row_counts(&self) -> Option<ArrayRef> {
+        Some(Arc::new(UInt64Array::from(self.rows.clone())))
+    }
+
+    /// Membership filters are per column chunk, not per page, so this knows
+    /// nothing a page at a time.
+    fn contained(&self, _column: &Column, _values: &HashSet<ScalarValue>) -> Option<BooleanArray> {
+        None
+    }
+}
+
 /// Pieces a `LIKE` predicate needs a segment to contain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubstringRequirement {

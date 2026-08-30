@@ -12,7 +12,7 @@ use datafusion::common::{DataFusionError, Result, Statistics};
 use datafusion::datasource::sink::DataSinkExec;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
-use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
+use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningPredicateBuilder};
 use datafusion::physical_plan::ExecutionPlan;
 
 use localtables_format::columnar::table::ColumnarTable;
@@ -20,6 +20,7 @@ use localtables_format::layout::manifest::SegmentEntry;
 
 use crate::columnar_exec::{to_df_error, ColumnarScanExec};
 use crate::dml::{compile_assignments, compile_predicate, ColumnarDataSink, DmlExec};
+use crate::columnar_exec::{PageFilters, Pruning};
 use crate::pruning::{substring_requirements, SegmentStatistics, SegmentZoneMaps};
 
 /// Exposes a [`ColumnarTable`] to DataFusion.
@@ -97,6 +98,17 @@ impl TableProvider for ColumnarTableProvider {
             .unwrap_or(candidates);
         let pruned = total - segments.len();
 
+        // The same predicates that chose the segments, handed on to test the
+        // pages inside them. Building them twice would be the same work and
+        // could disagree.
+        let pruning = Arc::new(Pruning {
+            segments_pruned: pruned,
+            pages: PageFilters::new(
+                self.predicates(state, &schema, filters),
+                referenced_columns(filters, &schema),
+            ),
+        });
+
         Ok(Arc::new(ColumnarScanExec::new(
             self.table.clone(),
             snapshot,
@@ -104,7 +116,7 @@ impl TableProvider for ColumnarTableProvider {
             projection.cloned(),
             limit,
             state.config().target_partitions(),
-            pruned,
+            pruning,
         )?))
     }
 
@@ -172,6 +184,30 @@ impl TableProvider for ColumnarTableProvider {
 }
 
 impl ColumnarTableProvider {
+    /// Turn the filters into predicates that can be tested against bounds.
+    ///
+    /// A filter that cannot become one, or that is trivially true, is left out
+    /// rather than treated as an error: it simply prunes nothing.
+    fn predicates(
+        &self,
+        state: &dyn Session,
+        schema: &SchemaRef,
+        filters: &[Expr],
+    ) -> Vec<Arc<PruningPredicate>> {
+        let Ok(df_schema) = datafusion::common::DFSchema::try_from(schema.as_ref().clone()) else {
+            return Vec::new();
+        };
+        filters
+            .iter()
+            .filter_map(|filter| {
+                let physical = state.create_physical_expr(filter.clone(), &df_schema).ok()?;
+                PruningPredicateBuilder::new()
+                    .with_file_schema(schema.clone())
+                    .build(physical)
+            })
+            .collect()
+    }
+
     /// Drop the segments the filters cannot match.
     ///
     /// Returns `None` when nothing could be ruled out, which the caller reads
@@ -192,13 +228,7 @@ impl ColumnarTableProvider {
         // Columns the filters mention. A membership filter is far larger than
         // a zone map and lives outside the metadata frame, so only these are
         // read; a filter on a column nobody asked about would prune nothing.
-        let mut bloom_columns: Vec<usize> = filters
-            .iter()
-            .flat_map(|filter| filter.column_refs())
-            .filter_map(|column| schema.index_of(&column.name).ok())
-            .collect();
-        bloom_columns.sort_unstable();
-        bloom_columns.dedup();
+        let bloom_columns = referenced_columns(filters, schema);
 
         // The LIKE predicates a trigram filter could act on. Read first,
         // because it decides which trigram filters are worth loading, and they
@@ -219,19 +249,7 @@ impl ColumnarTableProvider {
         let statistics = SegmentStatistics::new(schema.clone(), zone_maps);
 
         let mut keep = vec![true; candidates.len()];
-        let df_schema = datafusion::common::DFSchema::try_from(schema.as_ref().clone()).ok()?;
-        for filter in filters {
-            let Ok(physical) = state.create_physical_expr(filter.clone(), &df_schema) else {
-                continue;
-            };
-            // `build` returns nothing when the predicate is trivially true
-            // or cannot be turned into one, both of which prune nothing.
-            let Some(predicate) = PruningPredicateBuilder::new()
-                .with_file_schema(schema.clone())
-                .build(physical)
-            else {
-                continue;
-            };
+        for predicate in self.predicates(state, schema, filters) {
             let Ok(verdicts) = predicate.prune(&statistics) else {
                 continue;
             };
@@ -279,4 +297,19 @@ pub async fn register_columnar_table(
         .map_err(to_df_error)?;
     ctx.register_table(name, Arc::new(ColumnarTableProvider::new(table.clone())))?;
     Ok(table)
+}
+
+/// Positions of the columns a set of filters mentions.
+///
+/// Pruning reads bounds and filters for these and no others, so a scan does not
+/// pay for statistics on columns nobody asked about.
+fn referenced_columns(filters: &[Expr], schema: &SchemaRef) -> Vec<usize> {
+    let mut columns: Vec<usize> = filters
+        .iter()
+        .flat_map(|filter| filter.column_refs())
+        .filter_map(|column| schema.index_of(&column.name).ok())
+        .collect();
+    columns.sort_unstable();
+    columns.dedup();
+    columns
 }

@@ -214,6 +214,31 @@ Clustering costs write time, because the rows have to be reordered and that
 copies them. Groups come back already gathered, so it is one copy rather than
 the two that reordering and then slicing would take.
 
+## Page bounds
+
+A segment's zone map decides whether to read it at all. Page bounds decide which
+row ranges inside it a scan hands on: `page_rows` rows per page, recorded per
+column, stored as a buffer the decoder skips and read only when a predicate
+mentions that column.
+
+A segment of one page or fewer records none, since they would repeat the chunk's
+own zone map. Bounds cost roughly a tenth of a percent of a segment.
+
+The delete mask is applied inside a page rather than across the segment, because
+filtering the segment first would shift every row and leave the page boundaries
+describing the wrong ranges.
+
+Page pruning happens while the scan runs, not when the plan is built, because it
+needs bounds stored inside a segment that only a reader of that segment has. It
+therefore cannot show in `EXPLAIN`; `EXPLAIN ANALYZE` reports `pages_pruned`
+alongside the scan's output rows.
+
+**What this skips is handing a page upward, not decoding it.** A segment is
+decoded whole and then sliced, so a page nobody wants still costs whatever its
+columns cost to decode. On plain columns that is buffer wrapping and near
+nothing; on a dictionary column the whole segment is expanded first.
+`docs/performance.md` measures what that leaves on the table.
+
 ## Membership filters
 
 A zone map prunes `col = x` only when `x` sits outside a segment's minimum and

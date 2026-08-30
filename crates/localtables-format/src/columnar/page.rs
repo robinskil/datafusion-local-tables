@@ -112,6 +112,12 @@ pub enum BufferRole {
     /// Also not Arrow's. Pruning reads it to rule a segment out for a `LIKE`
     /// whose search term holds a piece no value in the segment contains.
     Trigram = 3,
+    /// Bounds for each page of the chunk, as an rkyv `Vec<ZoneMap>`.
+    ///
+    /// Also not Arrow's. A scan reads it to skip the row ranges inside a
+    /// segment that a predicate rules out, where the chunk's own zone map only
+    /// says whether to read the segment at all.
+    PageZones = 4,
 }
 
 /// One stored buffer.
@@ -230,6 +236,12 @@ pub struct SegmentMeta {
     /// Matched against the table header, so a segment cannot be read with the
     /// wrong schema after a botched recovery.
     pub schema_fingerprint: u64,
+    /// Rows each page of bounds covers. Zero when the segment has none.
+    ///
+    /// Recorded per segment rather than per column, because a page is a row
+    /// range and every column is cut the same way. Stored so a reader need not
+    /// know what the writer's options were.
+    pub page_rows: u64,
     pub columns: Vec<ColumnChunk>,
 }
 
@@ -314,6 +326,7 @@ mod tests {
             segment_id: 7,
             row_count: 100,
             schema_fingerprint: 0xdead_beef,
+            page_rows: 0,
             columns: vec![
                 chunk(Encoding::Plain, Codec::None),
                 chunk(Encoding::Dictionary, Codec::Zstd),

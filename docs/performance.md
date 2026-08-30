@@ -217,6 +217,44 @@ the 20% as the number for a larger one in either direction.
 Clustering also costs write time, since the rows have to be reordered. That is
 not measured either.
 
+## Page bounds inside a segment
+
+Bounds recorded for each row range inside a segment let a scan hand the filter
+above it one page rather than the whole segment. Measured on 500,000 rows in a
+single segment, so a segment zone map rules nothing out and page bounds are the
+only thing left to prune with:
+
+| variant | `WHERE id = 372145` |
+| --- | --- |
+| local, encodings on, no page bounds | 5.87 ms |
+| local, encodings on, page bounds | 6.04 ms |
+| local, plain columns, no page bounds | 4.18 ms |
+| local, plain columns, page bounds | 3.75 ms |
+| parquet | 6.20 ms |
+| parquet, page index | **0.96 ms** |
+
+**Page bounds do what they claim and it does not show on the clock.** The tests
+in `sql_pages.rs` measure the scan's own output and it falls from 10,000 rows to
+500, a twentyfold cut in what the filter above receives. The wall clock barely
+moves: about a tenth on plain columns, and nothing distinguishable from noise
+with dictionary encoding on.
+
+The reason is in those last two rows, and it is worth stating plainly.
+**Skipping a page here means not handing it upward, not avoiding the work of
+decoding it.** A segment is decoded whole and then sliced. For a plain column
+that decode is buffer wrapping and costs almost nothing, which is why a little
+shows through; for a dictionary column the whole segment is expanded first, and
+skipping pages afterwards saves none of it. Parquet's page index skips the
+decode itself, which is the entire 6.5x it gains here.
+
+So the work this leaves is not more statistics. It is teaching the decoder to
+build only the rows a caller asked for, at which point these bounds become worth
+what parquet's are.
+
+An earlier run of this benchmark showed page bounds ahead by 14% on encoded
+columns. That was noise: the unpruned measurement ranged from 6.18 to 6.84 ms.
+The figures above are from one run where every variant was built together.
+
 ## Parallel scans
 
 A segment is the unit a scan gives to a partition. Partitions take segments from

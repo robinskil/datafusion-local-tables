@@ -1079,3 +1079,157 @@ async fn a_segment_with_columns_the_schema_lost_is_refused() {
         "got {err:?}"
     );
 }
+
+/// Bounds for each row range inside a segment, so a scan can skip the ranges a
+/// predicate rules out rather than hand on the whole segment.
+#[tokio::test]
+async fn a_segment_records_bounds_for_each_of_its_pages() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    // Ten pages of a hundred, with ids running in order so each page covers a
+    // narrow, distinct range.
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from((0..1000).collect::<Vec<i32>>()))],
+    )
+    .unwrap();
+
+    let opts = TableOptions {
+        page_rows: 100,
+        ..options(Compression::None, false)
+    };
+    let (_dir, reader) = round_trip(&schema, &[batch], &opts).await;
+
+    assert_eq!(reader.page_rows().unwrap(), 100);
+    let zones = reader.page_zones(0).unwrap().expect("bounds per page");
+    assert_eq!(zones.len(), 10);
+
+    for (page, zone) in zones.iter().enumerate() {
+        let low = zone.min_array(&DataType::Int32).unwrap();
+        let high = zone.max_array(&DataType::Int32).unwrap();
+        let low = low.as_any().downcast_ref::<Int32Array>().unwrap().value(0);
+        let high = high.as_any().downcast_ref::<Int32Array>().unwrap().value(0);
+        assert_eq!(low, page as i32 * 100);
+        assert_eq!(high, page as i32 * 100 + 99);
+        assert_eq!(reader.page_range(page).unwrap(), Some((page * 100, 100)));
+    }
+    assert_eq!(reader.page_range(10).unwrap(), None);
+}
+
+/// A segment that is one page or fewer records none, because they would only
+/// repeat the chunk's own zone map.
+#[tokio::test]
+async fn a_segment_of_one_page_records_no_page_bounds() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from((0..50).collect::<Vec<i32>>()))],
+    )
+    .unwrap();
+
+    let opts = TableOptions {
+        page_rows: 100,
+        ..options(Compression::None, false)
+    };
+    let (_dir, reader) = round_trip(&schema, &[batch], &opts).await;
+
+    assert_eq!(reader.page_rows().unwrap(), 0);
+    assert!(reader.page_zones(0).unwrap().is_none());
+    assert_eq!(reader.page_range(0).unwrap(), None);
+}
+
+#[tokio::test]
+async fn switching_pages_off_records_none() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from((0..1000).collect::<Vec<i32>>()))],
+    )
+    .unwrap();
+
+    let opts = TableOptions {
+        page_rows: 0,
+        ..options(Compression::None, false)
+    };
+    let (_dir, reader) = round_trip(&schema, &[batch], &opts).await;
+    assert_eq!(reader.page_rows().unwrap(), 0);
+    assert!(reader.page_zones(0).unwrap().is_none());
+}
+
+/// A last page shorter than the rest is still covered.
+#[tokio::test]
+async fn a_ragged_last_page_is_covered() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from((0..250).collect::<Vec<i32>>()))],
+    )
+    .unwrap();
+
+    let opts = TableOptions {
+        page_rows: 100,
+        ..options(Compression::None, false)
+    };
+    let (_dir, reader) = round_trip(&schema, &[batch], &opts).await;
+
+    let zones = reader.page_zones(0).unwrap().unwrap();
+    assert_eq!(zones.len(), 3);
+    assert_eq!(reader.page_range(2).unwrap(), Some((200, 50)));
+    let high = zones[2].max_array(&DataType::Int32).unwrap();
+    assert_eq!(
+        high.as_any().downcast_ref::<Int32Array>().unwrap().value(0),
+        249
+    );
+}
+
+/// Page bounds must not disturb the data. They are a buffer the decoder skips.
+#[tokio::test]
+async fn page_bounds_do_not_change_what_a_segment_returns() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let ids: Vec<i32> = (0..500).collect();
+    let names: Vec<String> = ids.iter().map(|i| format!("name-{i}")).collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(StringArray::from(names)),
+        ],
+    )
+    .unwrap();
+
+    let with = TableOptions {
+        page_rows: 100,
+        ..options(Compression::None, false)
+    };
+    let without = TableOptions {
+        page_rows: 0,
+        ..options(Compression::None, false)
+    };
+    let (_a, paged) = round_trip(&schema, std::slice::from_ref(&batch), &with).await;
+    let (_b, plain) = round_trip(&schema, std::slice::from_ref(&batch), &without).await;
+
+    assert_eq!(paged.read(None).unwrap(), batch);
+    assert_eq!(plain.read(None).unwrap(), batch);
+    assert!(
+        paged.is_zero_copy(),
+        "page bounds must not cost the zero-copy read path"
+    );
+}

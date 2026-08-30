@@ -124,6 +124,16 @@ pub struct TableOptions {
     /// This is a layout, not an index: it stores no extra bytes and cannot
     /// affect what a query returns.
     pub cluster_by: Vec<String>,
+    /// Rows covered by each page of bounds inside a segment.
+    ///
+    /// A segment's own zone map decides whether to read it at all. These decide
+    /// which row ranges inside it a scan bothers to hand on, so a predicate
+    /// that matches a hundred rows of a hundred thousand costs the filter above
+    /// one page rather than the whole segment.
+    ///
+    /// Zero switches them off. They cost roughly a tenth of a percent of a
+    /// segment, so they are on by default.
+    pub page_rows: usize,
     /// Source bytes a rewrite holds in memory at once.
     ///
     /// Compaction and every rewrite read stored rows back before writing them
@@ -170,6 +180,7 @@ impl Default for TableOptions {
             dictionary_encoding: true,
             rle_encoding: true,
             cluster_by: Vec::new(),
+            page_rows: 8 * 1024,
             compaction_max_bytes: 256 * 1024 * 1024,
             bloom_filters: BloomFilters::default(),
             trigram_filters: BloomFilters::default(),

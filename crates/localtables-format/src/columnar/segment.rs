@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use crate::columnar::bloom::BloomFilter;
 use crate::columnar::trigram;
+use crate::columnar::zonemap::ZoneMap;
 use crate::columnar::decode::{decode_column, BufferSource, SegmentBytes};
 use crate::columnar::encode::{compress_buffers, encode_column, EncodedColumn};
 use crate::columnar::page::{
@@ -111,12 +112,16 @@ pub fn build_segment(
         } else {
             None
         };
+        // Bounds for each row range inside the segment, so a scan can skip the
+        // ranges a predicate rules out rather than hand on the whole segment.
+        let pages = page_zones(array.as_ref(), options.page_rows);
         chunks.push(write_chunk(
             &mut bytes,
             encoded,
             codec,
             bloom.as_ref(),
             trigram.as_ref(),
+            pages.as_deref(),
         )?);
     }
 
@@ -124,6 +129,13 @@ pub fn build_segment(
         segment_id,
         row_count: row_count as u64,
         schema_fingerprint,
+        // A segment with one page of bounds has none worth keeping: they would
+        // repeat the chunk's own zone map.
+        page_rows: if page_count(row_count, options.page_rows) > 1 {
+            options.page_rows as u64
+        } else {
+            0
+        },
         columns: chunks,
     };
 
@@ -139,6 +151,32 @@ pub fn build_segment(
         meta,
         bytes,
     })
+}
+
+/// How many pages of bounds a segment of `rows` rows holds.
+fn page_count(rows: usize, page_rows: usize) -> usize {
+    if page_rows == 0 {
+        return 0;
+    }
+    rows.div_ceil(page_rows)
+}
+
+/// Bounds for each page of one column.
+///
+/// `None` when the segment is one page or fewer, where these would only repeat
+/// the chunk's own zone map.
+fn page_zones(array: &dyn Array, page_rows: usize) -> Option<Vec<ZoneMap>> {
+    if page_count(array.len(), page_rows) < 2 {
+        return None;
+    }
+    let mut zones = Vec::with_capacity(page_count(array.len(), page_rows));
+    let mut start = 0;
+    while start < array.len() {
+        let len = page_rows.min(array.len() - start);
+        zones.push(ZoneMap::build(&array.slice(start, len)));
+        start += len;
+    }
+    Some(zones)
 }
 
 /// A column of nulls for rows written before the column existed.
@@ -182,6 +220,7 @@ fn write_chunk(
     codec: Codec,
     bloom: Option<&BloomFilter>,
     trigram: Option<&BloomFilter>,
+    pages: Option<&[ZoneMap]>,
 ) -> Result<ColumnChunk> {
     let stored = compress_buffers(codec, &encoded.buffers)?;
 
@@ -210,11 +249,22 @@ fn write_chunk(
 
     // Stored raw and after the loop above, so they take no part in the codec
     // decision. A filter is close to random bits, which no codec shrinks.
-    for (role, filter) in [(BufferRole::Bloom, bloom), (BufferRole::Trigram, trigram)] {
-        let Some(filter) = filter else { continue };
+    let mut side: Vec<(BufferRole, Vec<u8>)> = Vec::new();
+    if let Some(filter) = bloom {
+        side.push((BufferRole::Bloom, filter.to_bytes()));
+    }
+    if let Some(filter) = trigram {
+        side.push((BufferRole::Trigram, filter.to_bytes()));
+    }
+    if let Some(pages) = pages {
+        side.push((
+            BufferRole::PageZones,
+            rkyv::to_bytes::<rkyv::rancor::Error>(&pages.to_vec())?.to_vec(),
+        ));
+    }
+    for (role, stored) in side {
         pad_to_alignment(bytes);
         let offset = bytes.len() as u64;
-        let stored = filter.to_bytes();
         bytes.extend_from_slice(&stored);
         specs.push(BufferSpec {
             role,
@@ -227,7 +277,7 @@ fn write_chunk(
     let children = encoded
         .children
         .into_iter()
-        .map(|child| write_chunk(bytes, child, codec, None, None))
+        .map(|child| write_chunk(bytes, child, codec, None, None, None))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(ColumnChunk {
@@ -341,7 +391,45 @@ impl SegmentReader {
         self.filter(index, BufferRole::Trigram)
     }
 
+    /// The row range one page covers, clamped to the segment.
+    pub fn page_range(&self, page: usize) -> Result<Option<(usize, usize)>> {
+        let meta = self.meta()?;
+        let page_rows = meta.page_rows.to_native() as usize;
+        if page_rows == 0 {
+            return Ok(None);
+        }
+        let rows = meta.row_count.to_native() as usize;
+        let start = page.checked_mul(page_rows).filter(|start| *start < rows);
+        Ok(start.map(|start| (start, page_rows.min(rows - start))))
+    }
+
+    /// Rows each page of bounds covers, or zero when the segment has none.
+    pub fn page_rows(&self) -> Result<u64> {
+        Ok(self.meta()?.page_rows.to_native())
+    }
+
+    /// Bounds for each page of one column, when the segment stored them.
+    ///
+    /// Reads only the bounds, not the column. A segment written without them,
+    /// or one small enough that its own zone map says as much, reports `None`
+    /// and rules nothing out.
+    pub fn page_zones(&self, index: usize) -> Result<Option<Vec<ZoneMap>>> {
+        let Some(stored) = self.side_buffer(index, BufferRole::PageZones)? else {
+            return Ok(None);
+        };
+        let zones = rkyv::from_bytes::<Vec<ZoneMap>, rkyv::rancor::Error>(stored)?;
+        Ok(Some(zones))
+    }
+
     fn filter(&self, index: usize, role: BufferRole) -> Result<Option<BloomFilter>> {
+        let Some(stored) = self.side_buffer(index, role)? else {
+            return Ok(None);
+        };
+        BloomFilter::from_bytes(stored).map(Some)
+    }
+
+    /// The bytes of a buffer that is not Arrow's, checked against its checksum.
+    fn side_buffer(&self, index: usize, role: BufferRole) -> Result<Option<&[u8]>> {
         let meta = self.meta()?;
         let Some(chunk) = meta.columns.get(index) else {
             return Ok(None);
@@ -353,22 +441,22 @@ impl SegmentReader {
         let start = spec.extent.offset.to_native() as usize;
         let end = start
             .checked_add(spec.extent.len.to_native() as usize)
-            .ok_or_else(|| Error::corrupt("a membership filter's extent overflows"))?;
+            .ok_or_else(|| Error::corrupt(format!("a {role:?} buffer's extent overflows")))?;
         let all = self.bytes.as_slice();
         if end > all.len() {
             return Err(Error::corrupt(format!(
-                "a membership filter at {start}..{end} runs past the {}-byte segment",
+                "a {role:?} buffer at {start}..{end} runs past the {}-byte segment",
                 all.len()
             )));
         }
 
         let stored = &all[start..end];
         if checksum(stored) != spec.checksum.to_native() {
-            return Err(Error::corrupt(
-                "a membership filter failed its checksum".to_string(),
-            ));
+            return Err(Error::corrupt(format!(
+                "a {role:?} buffer failed its checksum"
+            )));
         }
-        BloomFilter::from_bytes(stored).map(Some)
+        Ok(Some(stored))
     }
 
     pub fn schema(&self) -> &SchemaRef {

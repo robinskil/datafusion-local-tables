@@ -642,8 +642,31 @@ impl ColumnarTable {
         entry: &SegmentEntry,
         projection: Option<&[usize]>,
     ) -> Result<Vec<RecordBatch>> {
-        self.read_segment_as(snapshot, entry, projection, &self.table_schema())
+        self.read_segment_as(snapshot, entry, projection, &self.table_schema(), None)
             .await
+    }
+
+    /// Read a segment, keeping only the pages a caller still wants.
+    ///
+    /// `keep_pages` names the pages of the segment worth handing on, as decided
+    /// by a predicate against the segment's page bounds. `None` keeps them all.
+    /// A page nobody keeps costs the filter above nothing, and on a cold file
+    /// its bytes are never faulted in.
+    pub async fn read_segment_pages(
+        &self,
+        snapshot: &Snapshot,
+        entry: &SegmentEntry,
+        projection: Option<&[usize]>,
+        keep_pages: Option<&[bool]>,
+    ) -> Result<Vec<RecordBatch>> {
+        self.read_segment_as(
+            snapshot,
+            entry,
+            projection,
+            &self.table_schema(),
+            keep_pages,
+        )
+        .await
     }
 
     async fn read_segment_as(
@@ -652,21 +675,51 @@ impl ColumnarTable {
         entry: &SegmentEntry,
         projection: Option<&[usize]>,
         schema: &TableSchema,
+        keep_pages: Option<&[bool]>,
     ) -> Result<Vec<RecordBatch>> {
         let reader = self.segment_reader_as(entry, schema).await?;
         let full = reader.read(projection)?;
 
-        let filtered = match snapshot.deletes_for(entry.segment_id) {
-            // No deletions is the common case, and it costs nothing.
-            None => full,
-            Some(dv) if dv.is_empty() => full,
-            Some(dv) => {
-                let mask = dv.keep_mask(full.num_rows());
-                arrow_select::filter::filter_record_batch(&full, &mask)?
+        // The mask covers the segment's own row positions, so it has to be
+        // applied to a page before the page is compacted; filtering first would
+        // shift every row and leave the page boundaries meaning nothing.
+        let mask = match snapshot.deletes_for(entry.segment_id) {
+            None => None,
+            Some(dv) if dv.is_empty() => None,
+            Some(dv) => Some(dv.keep_mask(full.num_rows())),
+        };
+
+        let ranges = match keep_pages {
+            None => vec![(0, full.num_rows())],
+            Some(keep) => {
+                let mut ranges = Vec::new();
+                for (page, wanted) in keep.iter().enumerate() {
+                    if !wanted {
+                        continue;
+                    }
+                    if let Some(range) = reader.page_range(page)? {
+                        ranges.push(range);
+                    }
+                }
+                ranges
             }
         };
 
-        Ok(slice_batches(filtered, self.inner.options.scan_batch_rows))
+        let mut out = Vec::new();
+        for (start, len) in ranges {
+            let page = full.slice(start, len);
+            let page = match &mask {
+                None => page,
+                Some(mask) => {
+                    arrow_select::filter::filter_record_batch(&page, &mask.slice(start, len))?
+                }
+            };
+            if page.num_rows() == 0 {
+                continue;
+            }
+            out.extend(slice_batches(page, self.inner.options.scan_batch_rows));
+        }
+        Ok(out)
     }
 
     /// Read the whole table as batches, segments first and then the rows still
@@ -889,7 +942,7 @@ impl ColumnarTable {
                 let mut pending_bytes = 0u64;
                 for entry in &sources {
                     for batch in self
-                        .read_segment_as(&snapshot, entry, None, &before)
+                        .read_segment_as(&snapshot, entry, None, &before, None)
                         .await?
                     {
                         pending.push(convert(&batch, &before.schema, &after.schema)?);
