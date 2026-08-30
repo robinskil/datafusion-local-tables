@@ -425,7 +425,7 @@ impl ExecutionPlan for ColumnarScanExec {
             snapshot: self.snapshot.clone(),
             projection: self.projection.clone(),
             pruning: self.pruning.clone(),
-            schema: self.table.schema(),
+            schema: self.snapshot.schema.clone(),
             pages_pruned: MetricBuilder::new(&self.metrics).counter("pages_pruned", partition),
         };
 

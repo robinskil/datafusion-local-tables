@@ -191,7 +191,7 @@ impl ColumnarTable {
         let mut pending_bytes = 0u64;
         for entry in sources {
             for batch in self
-                .read_segment_as(snapshot, entry, None, before, None)
+                .read_segment_as(snapshot, entry, None, &before.schema, &before.layout, None)
                 .await?
             {
                 pending.push(convert(&batch, &before.schema, &after.schema)?);

@@ -368,7 +368,7 @@ impl ColumnarTable {
 
     /// Swap in a snapshot of the writer's current state.
     pub(super) fn publish(&self, writer: &Writer) -> Result<()> {
-        let snapshot = build_snapshot(writer)?;
+        let snapshot = build_snapshot(writer, &self.table_schema())?;
         self.inner
             .current
             .store(self.inner.registry.publish(snapshot));

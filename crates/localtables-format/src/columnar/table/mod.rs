@@ -196,7 +196,7 @@ impl ColumnarTable {
         write::replay(&mut writer, checkpoint_lsn)?;
 
         let registry = SnapshotRegistry::new();
-        let snapshot = build_snapshot(&writer)?;
+        let snapshot = build_snapshot(&writer, &table_schema)?;
         let table = Self {
             inner: Arc::new(Inner {
                 current: ArcSwap::from(registry.publish(snapshot)),
@@ -300,10 +300,11 @@ async fn load_deletes(io: &dyn FileIo, entry: &SegmentEntry) -> Result<DeleteVec
 }
 
 /// Build the snapshot readers should see for the writer's current state.
-fn build_snapshot(writer: &Writer) -> Result<Arc<Snapshot>> {
+fn build_snapshot(writer: &Writer, current: &TableSchema) -> Result<Arc<Snapshot>> {
     Ok(Arc::new(Snapshot {
         txn_id: writer.file.meta().txn_id,
         schema: writer.file.schema().clone(),
+        layout: Arc::new(current.layout.clone()),
         manifest: Arc::new(writer.file.manifest().clone()),
         deletes: writer.delete_list(),
         memtable: Arc::new(writer.memtable.batches(None)?),

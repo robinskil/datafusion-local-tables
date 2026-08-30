@@ -17,6 +17,7 @@ use datafusion::physical_plan::ExecutionPlan;
 
 use localtables_format::columnar::table::ColumnarTable;
 use localtables_format::layout::manifest::SegmentEntry;
+use localtables_format::Snapshot;
 
 use crate::columnar_exec::{to_df_error, ColumnarScanExec};
 use crate::columnar_exec::{PageFilters, Pruning};
@@ -93,7 +94,7 @@ impl TableProvider for ColumnarTableProvider {
         let candidates: Vec<SegmentEntry> = snapshot.live_segments().cloned().collect();
         let total = candidates.len();
         let segments = self
-            .prune(state, &schema, filters, &candidates)
+            .prune(state, &snapshot, &schema, filters, &candidates)
             .await
             .unwrap_or(candidates);
         let pruned = total - segments.len();
@@ -219,6 +220,7 @@ impl ColumnarTableProvider {
     async fn prune(
         &self,
         state: &dyn Session,
+        snapshot: &Snapshot,
         schema: &SchemaRef,
         filters: &[Expr],
         candidates: &[SegmentEntry],
@@ -244,7 +246,7 @@ impl ColumnarTableProvider {
         // only, not column data.
         let mut zone_maps = Vec::with_capacity(candidates.len());
         for entry in candidates {
-            let reader = self.table.segment_reader(entry).await.ok()?;
+            let reader = self.table.segment_reader_for(snapshot, entry).await.ok()?;
             zone_maps.push(
                 SegmentZoneMaps::from_reader(&reader, &bloom_columns, &trigram_columns).ok()?,
             );

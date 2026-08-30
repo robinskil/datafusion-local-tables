@@ -6,9 +6,28 @@
 use super::*;
 
 impl ColumnarTable {
-    /// Open a segment for reading, keeping its bytes alive through the reader.
+    /// Open a segment through the table's current schema.
+    ///
+    /// A scan must use [`ColumnarTable::segment_reader_for`] instead, so it
+    /// decodes through the schema its snapshot was taken under.
     pub async fn segment_reader(&self, entry: &SegmentEntry) -> Result<SegmentReader> {
-        self.segment_reader_as(entry, &self.table_schema()).await
+        let current = self.table_schema();
+        self.segment_reader_as(entry, &current.schema, &current.layout)
+            .await
+    }
+
+    /// Open a segment through the schema a snapshot was taken under.
+    ///
+    /// A schema change can commit while a scan runs. The segments the scan
+    /// reads were written under the snapshot's schema, and the snapshot keeps
+    /// their bytes alive until it is dropped.
+    pub async fn segment_reader_for(
+        &self,
+        snapshot: &Snapshot,
+        entry: &SegmentEntry,
+    ) -> Result<SegmentReader> {
+        self.segment_reader_as(entry, &snapshot.schema, &snapshot.layout)
+            .await
     }
 
     /// Open a segment under a schema that is not necessarily the current one.
@@ -19,16 +38,11 @@ impl ColumnarTable {
     pub(super) async fn segment_reader_as(
         &self,
         entry: &SegmentEntry,
-        schema: &TableSchema,
+        schema: &SchemaRef,
+        layout: &SchemaLayout,
     ) -> Result<SegmentReader> {
         let bytes = self.inner.io.read_immutable(entry.data).await?;
-        SegmentReader::new(
-            bytes,
-            entry.data.offset,
-            entry.meta,
-            schema.schema.clone(),
-            &schema.layout,
-        )
+        SegmentReader::new(bytes, entry.data.offset, entry.meta, schema.clone(), layout)
     }
 
     /// Read one segment as batches, with deleted rows removed.
@@ -38,8 +52,15 @@ impl ColumnarTable {
         entry: &SegmentEntry,
         projection: Option<&[usize]>,
     ) -> Result<Vec<RecordBatch>> {
-        self.read_segment_as(snapshot, entry, projection, &self.table_schema(), None)
-            .await
+        self.read_segment_as(
+            snapshot,
+            entry,
+            projection,
+            &snapshot.schema,
+            &snapshot.layout,
+            None,
+        )
+        .await
     }
 
     /// Read a segment, keeping only the pages a caller still wants.
@@ -59,7 +80,8 @@ impl ColumnarTable {
             snapshot,
             entry,
             projection,
-            &self.table_schema(),
+            &snapshot.schema,
+            &snapshot.layout,
             keep_pages,
         )
         .await
@@ -70,10 +92,11 @@ impl ColumnarTable {
         snapshot: &Snapshot,
         entry: &SegmentEntry,
         projection: Option<&[usize]>,
-        schema: &TableSchema,
+        schema: &SchemaRef,
+        layout: &SchemaLayout,
         keep_pages: Option<&[bool]>,
     ) -> Result<Vec<RecordBatch>> {
-        let reader = self.segment_reader_as(entry, schema).await?;
+        let reader = self.segment_reader_as(entry, schema, layout).await?;
         let rows = reader.row_count()? as usize;
 
         // The mask covers the segment's own row positions, so it has to be

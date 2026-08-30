@@ -19,6 +19,7 @@ use parking_lot::Mutex;
 
 use crate::columnar::delete_vector::DeleteVector;
 use crate::layout::manifest::{Manifest, SegmentEntry, SegmentId};
+use crate::layout::schema::SchemaLayout;
 
 /// The table as it stood at one commit.
 ///
@@ -28,7 +29,17 @@ use crate::layout::manifest::{Manifest, SegmentEntry, SegmentId};
 pub struct Snapshot {
     /// The commit this snapshot reads.
     pub txn_id: u64,
+    /// The schema in force at this commit.
+    ///
+    /// A reader must decode through this, not through the table's current
+    /// schema. A schema change can commit while a scan still holds this
+    /// snapshot, and the segments here were written under this schema.
     pub schema: SchemaRef,
+    /// What `schema` implies about a segment's bytes.
+    ///
+    /// Carried rather than derived, because to derive it costs one IPC encode
+    /// per prefix, and a scan would pay that per segment.
+    pub layout: Arc<SchemaLayout>,
     pub manifest: Arc<Manifest>,
     /// Deleted rows per segment.
     ///
@@ -150,6 +161,9 @@ mod tests {
         Arc::new(Snapshot {
             txn_id,
             schema: Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
+            layout: Arc::new(crate::layout::schema::SchemaLayout::of(&Schema::new(vec![
+                Field::new("a", DataType::Int32, false),
+            ]))),
             manifest: Arc::new(Manifest::empty(crate::layout::DATA_START)),
             deletes: Vec::new(),
             memtable: Arc::new(Vec::new()),
@@ -196,6 +210,9 @@ mod tests {
         let mut snapshot = Snapshot {
             txn_id: 1,
             schema: Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
+            layout: Arc::new(crate::layout::schema::SchemaLayout::of(&Schema::new(vec![
+                Field::new("a", DataType::Int32, false),
+            ]))),
             manifest: Arc::new(Manifest::empty(crate::layout::DATA_START)),
             deletes: Vec::new(),
             memtable: Arc::new(Vec::new()),

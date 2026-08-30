@@ -534,6 +534,11 @@ crash part-way through leaves the old type and the old data.
 A change flushes first, so the memtable and the log never hold rows shaped by a
 schema that is no longer in force.
 
+A schema change can commit while a scan is still running. A scan therefore
+decodes through the schema its snapshot was taken under, not through the table's
+current one. A snapshot carries that schema and the layout it implies, and it
+keeps the bytes of its own segments alive until it is dropped.
+
 ## Alignment
 
 | boundary | value | reason |

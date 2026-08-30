@@ -428,3 +428,79 @@ async fn filters_are_rebuilt_by_a_cast() {
         );
     }
 }
+
+// ---- A schema change must not disturb a reader already under way ----------
+//
+// A snapshot pins the table as it stood at one commit. A schema change can
+// commit while a scan still holds one. The scan must decode through the schema
+// its snapshot was taken under, not through the table's current one.
+
+/// A cast rewrites every segment. A reader holding an older snapshot must still
+/// see its own rows, in their own type.
+#[tokio::test]
+async fn a_cast_does_not_disturb_a_pinned_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = table(&dir).await;
+
+    let pinned = table.snapshot();
+    assert_eq!(pinned.schema.field(0).data_type(), &DataType::Int32);
+
+    table.cast_column("id", DataType::Int64).await.unwrap();
+
+    // The reader reads again from the snapshot it pinned before the change.
+    let batches = table.scan(&pinned, None).await.unwrap();
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 6);
+    assert_eq!(
+        batches[0].column(0).data_type(),
+        &DataType::Int32,
+        "the pinned reader sees the type its snapshot was taken under"
+    );
+    assert_eq!(ints(&batches, "id"), vec![1, 2, 3, 4, 5, 6]);
+
+    // A reader that takes a snapshot now sees the new type.
+    let fresh = table.snapshot();
+    let batches = table.scan(&fresh, None).await.unwrap();
+    assert_eq!(batches[0].column(0).data_type(), &DataType::Int64);
+}
+
+/// An added column rewrites nothing, so the risk is the other way: the reader
+/// must not be handed a column its snapshot does not know about.
+#[tokio::test]
+async fn an_added_column_does_not_disturb_a_pinned_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = table(&dir).await;
+
+    let pinned = table.snapshot();
+    assert_eq!(pinned.schema.fields().len(), 2);
+
+    table
+        .add_column(Arc::new(Field::new("score", DataType::Float64, true)))
+        .await
+        .unwrap();
+
+    let batches = table.scan(&pinned, None).await.unwrap();
+    assert_eq!(
+        batches[0].num_columns(),
+        2,
+        "a pinned reader is handed the columns its snapshot names, and no more"
+    );
+    assert_eq!(ints(&batches, "id"), vec![1, 2, 3, 4, 5, 6]);
+
+    let fresh = table.snapshot();
+    let batches = table.scan(&fresh, None).await.unwrap();
+    assert_eq!(batches[0].num_columns(), 3);
+}
+
+/// A dropped column is the same shape of risk, and the segments are rewritten.
+#[tokio::test]
+async fn a_dropped_column_does_not_disturb_a_pinned_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = table(&dir).await;
+
+    let pinned = table.snapshot();
+    table.drop_column("name").await.unwrap();
+
+    let batches = table.scan(&pinned, None).await.unwrap();
+    assert_eq!(batches[0].num_columns(), 2);
+    assert_eq!(ints(&batches, "id"), vec![1, 2, 3, 4, 5, 6]);
+}
