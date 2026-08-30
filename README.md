@@ -50,8 +50,12 @@ clustering, projection and limit pushdown, crash-safe commits, a write-ahead
 log, and compaction.
 
 Filters and clustering are per-segment, so a table changes them by being
-rewritten: reopen with the options you want and call `rewrite_all`. The schema
-cannot change; `docs/format.md` covers what that would take.
+rewritten: reopen with the options you want and call `rewrite_all`.
+
+The schema can change too. Adding a nullable column and renaming one are single
+small commits; dropping a column and changing its type rewrite every segment, in
+the same commit as the schema, so a segment always matches the schema it is read
+under and zone maps and filters stay usable.
 
 Three IO backends: mmap (default), positional reads, and io_uring on Linux.
 The io_uring backend compiles for Linux but has not been run. See

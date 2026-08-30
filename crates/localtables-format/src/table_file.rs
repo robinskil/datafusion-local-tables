@@ -53,6 +53,12 @@ pub struct TableFile {
     committed: Committed,
 }
 
+/// Read a schema blob from the extent that names it.
+async fn read_schema(io: &dyn FileIo, extent: Extent) -> Result<Schema> {
+    let framed = io.read_at(extent.offset, extent.len as usize).await?;
+    schema_codec::decode(frame::decode(&framed, tag::SCHEMA, "schema")?)
+}
+
 impl TableFile {
     /// Create a table file. Fails when the path already exists.
     pub async fn create(
@@ -108,6 +114,7 @@ impl TableFile {
         // manifest, because a meta page and the manifest it points at must
         // agree on the txn.
         let mut seed = Manifest::empty(align_up(io.len()?, SEGMENT_ALIGN));
+        seed.schema = schema_extent;
         let seed_extent = write_manifest(io.as_ref(), &mut seed).await?;
 
         let mut manifest = seed.clone();
@@ -169,17 +176,19 @@ impl TableFile {
         let header: FileHeader =
             rkyv::deserialize::<_, rkyv::rancor::Error>(archived).map_err(Error::from)?;
 
-        let schema_frame = io
-            .read_at(header.schema.offset, header.schema.len as usize)
-            .await?;
-        let schema = Arc::new(schema_codec::decode(frame::decode(
-            &schema_frame,
-            tag::SCHEMA,
-            "schema",
-        )?)?);
-
+        // The manifest before the schema, because the manifest is what says
+        // which schema is in force. The header's is only the one the table was
+        // created with, and a table that has since changed it must not be read
+        // through the old one.
         let (committed, next_slot_manifest) = read_committed(io.as_ref()).await?;
         let next_slot = committed.slot.other();
+
+        let extent = if committed.manifest.schema.is_empty() {
+            header.schema
+        } else {
+            committed.manifest.schema
+        };
+        let schema = Arc::new(read_schema(io.as_ref(), extent).await?);
 
         Ok(Self {
             io,
@@ -194,6 +203,27 @@ impl TableFile {
         })
     }
 
+    /// Record a schema as the one in force, after a commit has made it so.
+    ///
+    /// Snapshots take their schema from here, so a change that did not reach
+    /// this would commit to disk and stay invisible to every reader.
+    pub fn set_schema(&mut self, schema: Arc<Schema>) {
+        self.schema = schema;
+    }
+
+    /// Store a schema and return where it landed.
+    ///
+    /// Schema blobs are appended and never freed. They are small next to the
+    /// data, and one stays reachable for every commit a reader might still be
+    /// pinned to, which is what the free list would otherwise have to reason
+    /// about.
+    pub async fn write_schema(&self, schema: &Schema) -> Result<Extent> {
+        let bytes = schema_codec::encode(schema);
+        let framed = frame::encode(tag::SCHEMA, &bytes);
+        let offset = self.io.append(&[&framed]).await?;
+        Ok(Extent::new(offset, framed.len() as u64))
+    }
+
     /// Open the table, creating it when the file is absent.
     pub async fn open_or_create(
         path: &Path,
@@ -203,13 +233,14 @@ impl TableFile {
     ) -> Result<Self> {
         if path.exists() {
             let file = Self::open(path, kind, options).await?;
+            // Against the schema in force, not the one the file was created
+            // with: a table that has added a column is still the same table.
             let want = schema_codec::fingerprint(&schema);
-            if file.header.schema_fingerprint != want {
+            let holds = schema_codec::fingerprint(file.schema());
+            if holds != want {
                 return Err(Error::SchemaMismatch(format!(
-                    "{} holds schema {:#018x}, caller supplied {:#018x}",
+                    "{} holds schema {holds:#018x}, caller supplied {want:#018x}",
                     path.display(),
-                    file.header.schema_fingerprint,
-                    want
                 )));
             }
             Ok(file)

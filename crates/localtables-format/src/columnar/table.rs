@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use tokio::sync::Mutex;
 
 use crate::columnar::delete_vector::DeleteVector;
@@ -28,7 +28,7 @@ use crate::layout::schema::SchemaLayout;
 use crate::config::TableOptions;
 use crate::io::FileIo;
 use crate::layout::manifest::{Manifest, SegmentEntry, SegmentId};
-use crate::layout::{schema as schema_codec, TableKind, BUFFER_ALIGN, SEGMENT_ALIGN};
+use crate::layout::{TableKind, BUFFER_ALIGN, SEGMENT_ALIGN};
 use crate::snapshot::{Snapshot, SnapshotRegistry};
 use crate::table_file::TableFile;
 use crate::wal::{encode_record, Lsn, SegmentDeletes, WalPair, WalPaths, WalRecord};
@@ -86,16 +86,36 @@ struct Inner {
     current: ArcSwap<Snapshot>,
     registry: SnapshotRegistry,
     path: PathBuf,
+    /// The schema in force. Swapped as a whole when a schema change commits,
+    /// so a reader never sees a schema and a layout that disagree.
+    schema: ArcSwap<TableSchema>,
+    options: TableOptions,
+}
+
+/// The schema in force, with everything derived from it.
+///
+/// These travel together because they must agree: a layout built from one
+/// schema and cluster columns resolved against another would write segments
+/// nothing could read back.
+#[derive(Debug)]
+struct TableSchema {
     schema: SchemaRef,
-    schema_fingerprint: u64,
     /// What a segment's bytes must look like to be read as this schema, for
     /// every prefix of it. A segment written before a column was added holds
     /// one of those prefixes.
     layout: SchemaLayout,
-    options: TableOptions,
-    /// Columns whose bits order the rows a flush writes, already resolved to
-    /// positions and checked against the schema.
+    /// Columns whose bits order the rows a flush writes, resolved to positions.
     cluster_columns: Vec<usize>,
+}
+
+impl TableSchema {
+    fn new(schema: SchemaRef, cluster_by: &[String]) -> Result<Self> {
+        Ok(Self {
+            cluster_columns: zorder::resolve(&schema, cluster_by)?,
+            layout: SchemaLayout::of(&schema),
+            schema,
+        })
+    }
 }
 
 /// A table stored in one local file, read column at a time.
@@ -129,11 +149,8 @@ impl ColumnarTable {
 
     async fn from_file(file: TableFile) -> Result<Self> {
         let schema = file.schema().clone();
-        let schema_fingerprint = schema_codec::fingerprint(&schema);
-        let layout = SchemaLayout::of(&schema);
-        // Checked here rather than at flush, so a name that is wrong is an
-        // error the caller sees before the table has accepted a single row.
-        let cluster_columns = zorder::resolve(&schema, &file.options().cluster_by)?;
+        let table_schema = Arc::new(TableSchema::new(schema.clone(), &file.options().cluster_by)?);
+
         let io = file.io().clone();
         let options = file.options().clone();
         let path = file.path().to_path_buf();
@@ -176,11 +193,8 @@ impl ColumnarTable {
                 io,
                 registry,
                 path,
-                schema,
-                schema_fingerprint,
-                layout,
+                schema: ArcSwap::from(table_schema),
                 options,
-                cluster_columns,
             }),
         };
 
@@ -192,8 +206,13 @@ impl ColumnarTable {
         Ok(table)
     }
 
-    pub fn schema(&self) -> &SchemaRef {
-        &self.inner.schema
+    pub fn schema(&self) -> SchemaRef {
+        self.inner.schema.load().schema.clone()
+    }
+
+    /// The schema in force with everything derived from it, taken as one.
+    fn table_schema(&self) -> Arc<TableSchema> {
+        self.inner.schema.load_full()
     }
 
     pub fn options(&self) -> &TableOptions {
@@ -229,11 +248,11 @@ impl ColumnarTable {
             return Ok(0);
         }
         for batch in batches {
-            if batch.schema().fields() != self.inner.schema.fields() {
+            if batch.schema().fields() != self.schema().fields() {
                 return Err(Error::SchemaMismatch(format!(
                     "a batch has schema {:?}, the table expects {:?}",
                     batch.schema(),
-                    self.inner.schema
+                    self.schema()
                 )));
             }
         }
@@ -331,11 +350,11 @@ impl ColumnarTable {
             return Ok(0);
         }
         for batch in replacements {
-            if batch.schema().fields() != self.inner.schema.fields() {
+            if batch.schema().fields() != self.schema().fields() {
                 return Err(Error::SchemaMismatch(format!(
                     "a replacement batch has schema {:?}, the table expects {:?}",
                     batch.schema(),
-                    self.inner.schema
+                    self.schema()
                 )));
             }
         }
@@ -352,7 +371,7 @@ impl ColumnarTable {
             0 => None,
             1 => Some(replacements[0].clone()),
             _ => Some(arrow_select::concat::concat_batches(
-                &self.inner.schema,
+                &self.schema(),
                 replacements,
             )?),
         };
@@ -366,7 +385,7 @@ impl ColumnarTable {
             batch: match &merged {
                 Some(batch) => crate::layout::batchcodec::encode(batch),
                 None => crate::layout::batchcodec::encode(&RecordBatch::new_empty(
-                    self.inner.schema.clone(),
+                    self.schema(),
                 )),
             },
         };
@@ -518,13 +537,14 @@ impl ColumnarTable {
         batches: Vec<RecordBatch>,
         group_rows: usize,
     ) -> Result<Vec<Vec<RecordBatch>>> {
-        if self.inner.cluster_columns.is_empty() {
+        let current = self.table_schema();
+        if current.cluster_columns.is_empty() {
             return Ok(split_row_groups(batches, group_rows));
         }
         zorder::cluster(
             &batches,
-            &self.inner.schema,
-            &self.inner.cluster_columns,
+            &current.schema,
+            &current.cluster_columns,
             group_rows,
         )
     }
@@ -542,10 +562,11 @@ impl ColumnarTable {
         }
 
         let segment_id = manifest.next_segment_id;
+        let current = self.table_schema();
         let built = build_segment(
             segment_id,
-            &self.inner.schema,
-            self.inner.layout.current(),
+            &current.schema,
+            current.layout.current(),
             batches,
             &self.inner.options,
         )?;
@@ -591,12 +612,13 @@ impl ColumnarTable {
     /// Open a segment for reading, keeping its bytes alive through the reader.
     pub async fn segment_reader(&self, entry: &SegmentEntry) -> Result<SegmentReader> {
         let bytes = self.inner.io.read_immutable(entry.data).await?;
+        let current = self.table_schema();
         SegmentReader::new(
             bytes,
             entry.data.offset,
             entry.meta,
-            self.inner.schema.clone(),
-            &self.inner.layout,
+            current.schema.clone(),
+            &current.layout,
         )
     }
 
@@ -683,6 +705,208 @@ impl ColumnarTable {
             .map(|entry| entry.segment_id)
             .collect();
         self.compact_segments(&segment_ids).await
+    }
+
+    // ---- Schema changes -------------------------------------------------
+    //
+    // Two shapes. A change that leaves every stored byte meaning what it meant
+    // records a new schema and nothing else. A change that does not rewrites
+    // every segment *in the same commit* as the new schema, so there is never
+    // an instant where the schema says one thing and a segment holds another.
+    // That is what keeps zone maps, filters and the zero-copy read path honest
+    // through a schema change: a segment always matches the schema in force.
+
+    /// Add a column to the end of the schema.
+    ///
+    /// Rows already stored have no value for it and read as null, so the field
+    /// must be nullable. Nothing is rewritten: this is one small commit
+    /// whatever the table holds.
+    ///
+    /// The column goes at the end because anywhere else would move the columns
+    /// after it, and a segment addresses its columns by position.
+    pub async fn add_column(&self, field: FieldRef) -> Result<()> {
+        if !field.is_nullable() {
+            return Err(Error::InvalidArgument(format!(
+                "cannot add a non-nullable column {}: the rows already stored \
+                 have no value for it",
+                field.name()
+            )));
+        }
+        let current = self.schema();
+        if current.index_of(field.name()).is_ok() {
+            return Err(Error::InvalidArgument(format!(
+                "the table already has a column named {}",
+                field.name()
+            )));
+        }
+
+        let mut fields: Vec<FieldRef> = current.fields().iter().cloned().collect();
+        fields.push(field);
+        self.set_schema(schema_with(&current, fields), false).await
+    }
+
+    /// Rename a column.
+    ///
+    /// Nothing is rewritten. A segment's bytes mean what its column *types*
+    /// say, so a name is not part of what makes them readable.
+    pub async fn rename_column(&self, from: &str, to: &str) -> Result<()> {
+        let current = self.schema();
+        let at = current.index_of(from).map_err(|_| {
+            Error::InvalidArgument(format!("the table has no column named {from}"))
+        })?;
+        if from != to && current.index_of(to).is_ok() {
+            return Err(Error::InvalidArgument(format!(
+                "the table already has a column named {to}"
+            )));
+        }
+
+        let mut fields: Vec<FieldRef> = current.fields().iter().cloned().collect();
+        fields[at] = Arc::new(fields[at].as_ref().clone().with_name(to));
+        self.set_schema(schema_with(&current, fields), false).await
+    }
+
+    /// Drop a column.
+    ///
+    /// Rewrites every segment, which is also what reclaims the column's bytes.
+    /// A drop that only edited the schema would leave them on disk until
+    /// something rewrote the table anyway.
+    pub async fn drop_column(&self, name: &str) -> Result<()> {
+        let current = self.schema();
+        let at = current.index_of(name).map_err(|_| {
+            Error::InvalidArgument(format!("the table has no column named {name}"))
+        })?;
+        if current.fields().len() == 1 {
+            return Err(Error::InvalidArgument(
+                "cannot drop the last column of a table".into(),
+            ));
+        }
+
+        let mut fields: Vec<FieldRef> = current.fields().iter().cloned().collect();
+        fields.remove(at);
+        self.set_schema(schema_with(&current, fields), true).await
+    }
+
+    /// Change a column's type.
+    ///
+    /// Rewrites every segment, casting as it goes, so that afterwards every
+    /// segment holds the new type. The alternative is casting at read time,
+    /// which would cost the column its zero-copy path on every scan and leave
+    /// zone maps recorded in the old type and unusable. A cast that cannot
+    /// represent a stored value fails the whole change rather than committing
+    /// nulls in place of data.
+    pub async fn cast_column(&self, name: &str, to: DataType) -> Result<()> {
+        let current = self.schema();
+        let at = current.index_of(name).map_err(|_| {
+            Error::InvalidArgument(format!("the table has no column named {name}"))
+        })?;
+        if current.field(at).data_type() == &to {
+            return Ok(());
+        }
+        if !arrow_cast::can_cast_types(current.field(at).data_type(), &to) {
+            return Err(Error::InvalidArgument(format!(
+                "cannot cast {name} from {} to {to}",
+                current.field(at).data_type()
+            )));
+        }
+
+        let mut fields: Vec<FieldRef> = current.fields().iter().cloned().collect();
+        fields[at] = Arc::new(Field::new(name, to, fields[at].is_nullable()));
+        self.set_schema(schema_with(&current, fields), true).await
+    }
+
+    /// Commit a new schema, rewriting the data first when it has to.
+    ///
+    /// `rewrite` says whether the stored bytes still mean what the new schema
+    /// says. When they do not, every live row is read under the old schema,
+    /// converted, and written under the new one, and the new segments and the
+    /// new schema land in a single commit.
+    async fn set_schema(&self, schema: SchemaRef, rewrite: bool) -> Result<()> {
+        // Anything still in the memtable or the log is shaped by the old
+        // schema. Landing it first means the change only has segments to think
+        // about.
+        self.flush().await?;
+
+        let before = self.table_schema();
+        let after = Arc::new(TableSchema::new(schema, &self.inner.options.cluster_by)?);
+
+        // Read under the old schema, outside the writer lock.
+        let snapshot = self.snapshot();
+        let sources: Vec<SegmentEntry> = snapshot.live_segments().cloned().collect();
+        let mut converted: Vec<RecordBatch> = Vec::new();
+        if rewrite {
+            for entry in &sources {
+                for batch in self.read_segment(&snapshot, entry, None).await? {
+                    converted.push(convert(&batch, &before.schema, &after.schema)?);
+                }
+            }
+        }
+
+        let mut writer = self.inner.writer.lock().await;
+        if !writer.memtable.is_empty() {
+            // A write landed between the flush above and this lock. Its rows
+            // are shaped by the old schema, so the change is abandoned rather
+            // than committed over them.
+            return Err(Error::InvalidArgument(
+                "a write landed while the schema was changing; try again".into(),
+            ));
+        }
+        let mut manifest = writer.file.manifest().clone();
+        manifest.txn_id = writer.file.meta().txn_id + 1;
+        manifest.schema = writer.file.write_schema(&after.schema).await?;
+        let min_active = self.inner.registry.min_active_txn();
+
+        if rewrite {
+            // The new schema has to be in force before a segment is written
+            // under it, and the write is what could fail, so it is put back on
+            // any error below.
+            self.inner.schema.store(after.clone());
+            let rows: u64 = converted.iter().map(|b| b.num_rows() as u64).sum();
+            let group_rows = self.inner.options.row_group_size_for(rows);
+            let written = async {
+                for group in self.row_groups(converted, group_rows)? {
+                    self.write_segment(&writer.file, &mut manifest, &group, min_active)
+                        .await?;
+                }
+                Ok::<(), Error>(())
+            }
+            .await;
+            if let Err(error) = written {
+                self.inner.schema.store(before);
+                return Err(error);
+            }
+
+            manifest
+                .segments
+                .retain(|entry| !sources.iter().any(|s| s.segment_id == entry.segment_id));
+            for entry in &sources {
+                manifest.free(entry.data);
+                if let Some(dv) = entry.deletes {
+                    manifest.free(dv);
+                }
+                writer.deletes.remove(&entry.segment_id);
+                writer.dirty_deletes.remove(&entry.segment_id);
+            }
+        }
+
+        match self.commit(&mut writer, manifest).await {
+            Ok(()) => {
+                // Three places hold the schema besides the manifest, and all of
+                // them have to move together with it: the file, which is what a
+                // snapshot copies; the memtable, which the next insert is
+                // checked against and which a scan projects alongside the
+                // segments; and the handle readers load from.
+                writer.file.set_schema(after.schema.clone());
+                writer.memtable =
+                    Memtable::new(after.schema.clone(), writer.memtable.next_seqno());
+                self.inner.schema.store(after);
+                self.publish(&writer)?;
+                Ok(())
+            }
+            Err(error) => {
+                self.inner.schema.store(before);
+                Err(error)
+            }
+        }
     }
 
     /// Rewrite the named segments into one, dropping their deleted rows.
@@ -1055,6 +1279,30 @@ fn slice_batches(batch: RecordBatch, rows: usize) -> Vec<RecordBatch> {
         .step_by(rows)
         .map(|start| batch.slice(start, rows.min(batch.num_rows() - start)))
         .collect()
+}
+
+/// The same schema with different fields, keeping its metadata.
+fn schema_with(schema: &SchemaRef, fields: Vec<FieldRef>) -> SchemaRef {
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+/// Reshape a batch read under `before` into one that fits `after`.
+///
+/// Columns are matched by name, so dropping one leaves the rest where they
+/// belong rather than shifting them. A column the old schema does not have is
+/// filled with nulls, which is the same thing an added column means.
+fn convert(batch: &RecordBatch, before: &SchemaRef, after: &SchemaRef) -> Result<RecordBatch> {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(after.fields().len());
+    for field in after.fields() {
+        let column = match before.index_of(field.name()) {
+            Ok(at) if batch.column(at).data_type() == field.data_type() => batch.column(at).clone(),
+            Ok(at) => arrow_cast::cast(batch.column(at), field.data_type())?,
+            Err(_) => arrow_array::new_null_array(field.data_type(), batch.num_rows()),
+        };
+        columns.push(column);
+    }
+    let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    RecordBatch::try_new_with_options(after.clone(), columns, &options).map_err(Error::from)
 }
 
 #[cfg(test)]

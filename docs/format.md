@@ -356,18 +356,38 @@ only one row order. A trigram filter on text that was grouped by segment before
 the rewrite can come out pruning nothing afterwards, still correct and no longer
 useful.
 
-**The schema cannot change.** Adding, dropping, renaming or retyping a column is
-not supported, and opening with a schema that does not match the stored
-fingerprint is refused. Two things in the format stand in the way, and both are
-format changes rather than missing plumbing:
+### Changing the schema
 
-* the schema lives in the file header, which is written once and never
-  rewritten, so there is nowhere to record a new one;
-* a segment addresses its columns by position, so dropping a column would
-  silently shift every column after it in every segment already written.
+The header records the schema a table was created with and is never rewritten.
+The manifest records the one in force, and every commit rewrites that, so a
+schema change is an ordinary commit.
 
-Stable field identifiers in `SegmentMeta`, and the schema moved into the
-manifest where every commit rewrites it, are what these would need.
+Changes come in two shapes:
+
+| change | cost | why |
+| --- | --- | --- |
+| add a nullable column | one small commit | old segments hold a prefix of the schema and read the new column as null |
+| rename a column | one small commit | a segment's bytes mean what its column *types* say, and names take no part in that |
+| drop a column | rewrites every segment | a segment addresses columns by position, so a drop would shift the ones after it |
+| change a column's type | rewrites every segment | see below |
+
+A column is added at the end, because anywhere else would move the columns after
+it, which is the same problem a drop has.
+
+**A cast rewrites rather than converting at read time.** Converting lazily would
+work, and it would cost the column its zero-copy path on every scan for as long
+as the table lived, and it would leave every zone map on that column recorded in
+the old type and so unusable for pruning. Rewriting pays once and leaves
+everything downstream true of the column: bounds, membership filters, trigram
+filters and the buffers themselves are all in the current type.
+
+The rewrite and the schema go into **one commit**. There is never an instant
+where the manifest says `Int64` and a segment holds `Int32`, so a reader can
+always trust that a segment matches the schema it is being read under, and a
+crash part-way through leaves the old type and the old data.
+
+A change flushes first, so the memtable and the log never hold rows shaped by a
+schema that is no longer in force.
 
 ## Alignment
 

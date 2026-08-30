@@ -63,6 +63,16 @@ pub struct Manifest {
     pub next_segment_id: SegmentId,
     /// Next row sequence number the memtable will hand out.
     pub next_seqno: u64,
+    /// The schema this commit's data was written against.
+    ///
+    /// The header points at the schema a table was created with and can never
+    /// be rewritten; this is the one in force now. A commit that changes the
+    /// schema writes a new blob and points here at it, in the same commit as
+    /// whatever segments the change required, so the two can never disagree.
+    ///
+    /// Empty means the table has never changed its schema and the header's
+    /// still stands.
+    pub schema: Extent,
     pub segments: Vec<SegmentEntry>,
     pub free_extents: Vec<FreeExtent>,
     /// End of the allocated region. New extents start here when no free extent fits.
@@ -77,6 +87,7 @@ impl Manifest {
             checkpoint_lsn: 0,
             next_segment_id: 0,
             next_seqno: 0,
+            schema: Extent::EMPTY,
             segments: Vec::new(),
             free_extents: Vec::new(),
             file_len,
@@ -119,6 +130,7 @@ impl ArchivedManifest {
             checkpoint_lsn: self.checkpoint_lsn.to_native(),
             next_segment_id: self.next_segment_id.to_native(),
             next_seqno: self.next_seqno.to_native(),
+            schema: self.schema.to_native(),
             segments: self
                 .segments
                 .iter()
