@@ -256,6 +256,45 @@ Only the rows inside one table are comparable with each other. An earlier
 version of this section reported page bounds ahead by 14% on encoded columns
 before the decoder changed; that was noise across exactly this kind of gap.
 
+## Which columns are worth compressing
+
+A codec is never free here: the read path is zero-copy only while a column is
+stored raw. Compressing it trades the mapped bytes for a buffer the reader owns
+and a pass to fill it. So the question is not how small a codec makes a column
+but whether that column had anything to gain.
+
+Ratios over 500,000 rows, uncompressed over compressed:
+
+| column | lz4 | zstd |
+| --- | --- | --- |
+| random u64 | 1.00x | 1.00x |
+| sequential i64 | 2.0x | 7.7x |
+| text | 4.4x | 24x |
+
+**Scattered numbers do not compress, with either codec.** The tidy figures for
+sequential integers are a property of the fixture, not of numeric data.
+
+End to end, same 500,000 rows, four settings built in one run:
+
+| setting | file | full scan | string group by | read every column |
+| --- | --- | --- | --- | --- |
+| raw | 13808 KiB | 311 us | 1.81 ms | 407 us |
+| **auto** | **11866 KiB** | 312 us | 1.78 ms | 416 us |
+| lz4 everywhere | 7976 KiB | 315 us | 1.78 ms | 580 us |
+| zstd everywhere | 4309 KiB | 1.17 ms | 1.79 ms | 1.23 ms |
+
+`Auto` compresses text and binary and leaves the rest raw. It is 14% smaller
+than raw and 2% slower on the worst of the three queries, which is why it is the
+default. Compressing everything reaches 42% and 69% smaller and costs 42% and
+202% on a read of every column.
+
+Two things worth noticing. The string group by is unmoved by any setting,
+because that column is low cardinality and already dictionary encoded, so its
+values buffer is tiny whatever wraps it. And lz4 everywhere costs almost nothing
+on the full scan, because the column it reads did not shrink and the writer
+therefore stored it raw: a codec that fails to earn its place is dropped per
+buffer, which protects the zero-copy path without anyone choosing anything.
+
 ## Parallel scans
 
 A segment is the unit a scan gives to a partition. Partitions take segments from

@@ -87,12 +87,18 @@ pub fn build_segment(
     let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
     let columns = concat_columns(schema, batches, row_count)?;
 
-    let codec: Codec = options.compression.into();
     let mut bytes: Vec<u8> = Vec::new();
     let mut chunks = Vec::with_capacity(columns.len());
 
     for (index, array) in columns.iter().enumerate() {
         let encoded = encode_column(array.as_ref(), options)?;
+        // Chosen per column, because whether a codec pays depends on what the
+        // column holds: text compresses several times over, scattered numbers
+        // not at all, and a codec that gains nothing still costs the column its
+        // zero-copy read path.
+        let codec = options
+            .compression
+            .codec_for(schema.field(index).data_type());
         // Built here rather than inside the encoder, because whether a column
         // gets a filter is a question about its name, not about its values.
         let name = schema.field(index).name();

@@ -135,6 +135,12 @@ Two things are still type-specific, and deliberately:
 * **Zone maps** are built only for types with an order this format can record —
   the numbers, strings, binary, and the date and time types. Everything else
   reports no bound and prunes nothing, which costs a read and never loses a row.
+* **Compression** is chosen per column, because whether a codec pays depends on
+  what the column holds. The default compresses text and binary with lz4 and
+  stores everything else raw: scattered numbers do not compress with any codec,
+  and a codec that gains nothing still costs the column its zero-copy read path.
+  A codec that fails to shrink a particular buffer is dropped for that buffer,
+  so the protection holds even when a caller asks for one everywhere.
 * **Dictionary and run-length encoding** are only *chosen* for the flat types
   Arrow can cast, and only when they make the column smaller. A column the
   schema already declares as a dictionary is stored that way and never expanded,

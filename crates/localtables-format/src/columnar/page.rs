@@ -73,16 +73,6 @@ impl ArchivedCodec {
     }
 }
 
-impl From<crate::config::Compression> for Codec {
-    fn from(value: crate::config::Compression) -> Self {
-        match value {
-            crate::config::Compression::None => Codec::None,
-            crate::config::Compression::Lz4 => Codec::Lz4,
-            crate::config::Compression::Zstd => Codec::Zstd,
-        }
-    }
-}
-
 /// What a stored buffer means to the decoder.
 ///
 /// A chunk holds the null bitmap, then Arrow's own buffers for the array in

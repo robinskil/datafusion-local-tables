@@ -18,7 +18,9 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use parquet::arrow::ArrowWriter;
 
 use datafusion_local_tables::ColumnarTableProvider;
-use localtables_format::{BloomFilters, ColumnarTable, Durability, IoBackend, TableOptions};
+use localtables_format::{
+    BloomFilters, ColumnarTable, Compression, Durability, IoBackend, TableOptions,
+};
 
 const ROWS: i64 = 500_000;
 const ROWS_PER_SEGMENT: i64 = 50_000;
@@ -672,6 +674,73 @@ fn scattered_point_lookup(c: &mut Criterion) {
 
 
 
+
+/// What compressing a column actually costs a query, and what it saves.
+///
+/// The read path is zero-copy only while a column is stored raw, so a codec is
+/// never free: it trades the mapped bytes for a buffer the reader owns and a
+/// pass to fill it. Auto compresses text and binary and leaves everything else
+/// alone, which is the shape the codec measurements point at.
+fn compression_choice(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let build = |name: &'static str, compression: Compression| {
+        let path = dir.path().join(format!("{name}.lt"));
+        runtime.block_on(async move {
+            let table = ColumnarTable::create(
+                &path,
+                schema(),
+                TableOptions {
+                    durability: Durability::None,
+                    io_backend: IoBackend::Mmap,
+                    memtable_max_bytes: 256 * 1024 * 1024,
+                    compression,
+                    ..TableOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            for batch in batches() {
+                table.insert(&[batch]).await.unwrap();
+                table.flush().await.unwrap();
+            }
+            table
+        })
+    };
+
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+    for (name, compression) in [
+        ("raw", Compression::None),
+        ("auto", Compression::Auto),
+        ("lz4", Compression::Lz4),
+        ("zstd", Compression::Zstd),
+    ] {
+        ctx.register_table(
+            name,
+            Arc::new(ColumnarTableProvider::new(build(name, compression))),
+        )
+        .unwrap();
+        let size: u64 = std::fs::metadata(dir.path().join(format!("{name}.lt")))
+            .unwrap()
+            .len();
+        println!("{name:>5} file {:>6} KiB", size / 1024);
+    }
+
+    for (label, sql) in [
+        ("full scan", "SELECT sum(payload) FROM {}"),
+        ("string group by", "SELECT category, count(*) FROM {} GROUP BY category"),
+        ("point lookup", "SELECT * FROM {} WHERE id = 372145"),
+    ] {
+        let mut group = c.benchmark_group(format!("compression: {label}"));
+        for table in ["raw", "auto", "lz4", "zstd"] {
+            let sql = sql.replace("{}", table);
+            group.bench_function(table, |b| b.iter(|| run(&ctx, &runtime, &sql)));
+        }
+        group.finish();
+    }
+}
+
 /// A point lookup with nothing but page bounds to prune with.
 ///
 /// The whole table is one segment, so its zone map rules nothing out and every
@@ -1008,6 +1077,7 @@ criterion_group!(
     parquet_view_types,
     scattered_point_lookup,
     page_pruning,
+    compression_choice,
     substring_search,
     clustered_layout,
     small_writes
