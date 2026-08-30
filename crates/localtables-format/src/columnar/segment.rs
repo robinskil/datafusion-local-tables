@@ -91,55 +91,8 @@ pub fn build_segment(
     let mut chunks = Vec::with_capacity(columns.len());
 
     for (index, array) in columns.iter().enumerate() {
-        // Chosen per column, because whether a codec pays depends on what the
-        // column holds: text compresses several times over, scattered numbers
-        // not at all, and a codec that gains nothing still costs the column its
-        // zero-copy read path.
-        let codec = options
-            .compression
-            .codec_for(schema.field(index).data_type());
-
-        // A column that will be cut into blocks is encoded block by block, so
-        // encoding it whole as well would be work thrown away: the outer chunk
-        // keeps no buffers. Only what describes the column as a whole is built.
-        let encoded = if blocks_wanted(array.as_ref(), codec, options) {
-            EncodedColumn::describing(array.as_ref())
-        } else {
-            encode_column(array.as_ref(), options)?
-        };
-
-        // Built here rather than inside the encoder, because whether a column
-        // gets a filter is a question about its name, not about its values.
-        let name = schema.field(index).name();
-        let bloom = if options.bloom_filters.covers(name) {
-            BloomFilter::build(array.as_ref(), options.bloom_bits_per_value)?
-        } else {
-            None
-        };
-        let trigram = if options.trigram_filters.covers(name) {
-            // The column's own stored size is the budget, so a filter never
-            // outweighs the data it describes.
-            trigram::build(
-                array.as_ref(),
-                options.bloom_bits_per_value,
-                array.get_array_memory_size(),
-            )?
-        } else {
-            None
-        };
-        // Bounds for each row range inside the segment. A scan then skips the
-        // ranges a predicate rules out, and hands on the rest.
-        let pages = page_zones(array.as_ref(), options.page_rows);
-        chunks.push(write_blocked_chunk(
-            &mut bytes,
-            array.as_ref(),
-            encoded,
-            codec,
-            options,
-            bloom.as_ref(),
-            trigram.as_ref(),
-            pages.as_deref(),
-        )?);
+        let chunk = write_column(&mut bytes, array.as_ref(), schema.field(index), options)?;
+        chunks.push(chunk);
     }
 
     let meta = SegmentMeta {
@@ -175,6 +128,65 @@ pub fn build_segment(
         meta,
         bytes,
     })
+}
+
+/// Encode one column, build what describes it, and append it to the segment.
+///
+/// The order matters only in that the codec decides how the column is stored,
+/// and that decides whether to encode it whole. Everything else describes the
+/// column and does not depend on the rest.
+fn write_column(
+    bytes: &mut Vec<u8>,
+    array: &dyn Array,
+    field: &arrow_schema::Field,
+    options: &TableOptions,
+) -> Result<ColumnChunk> {
+    // Chosen per column, because whether a codec pays depends on what the
+    // column holds. Text compresses several times over. Scattered numbers do
+    // not compress at all. A codec that gains nothing still costs the column
+    // its zero-copy read path.
+    let codec = options.compression.codec_for(field.data_type());
+
+    // A column that goes into blocks is encoded block by block. To encode it
+    // whole as well would be work thrown away, because the outer chunk keeps no
+    // buffers. Only what describes the column as a whole is built.
+    let encoded = if blocks_wanted(array, codec, options) {
+        EncodedColumn::describing(array)
+    } else {
+        encode_column(array, options)?
+    };
+
+    // Built here rather than inside the encoder. Whether a column gets a filter
+    // is a question about its name, not about its values.
+    let bloom = match options.bloom_filters.covers(field.name()) {
+        true => BloomFilter::build(array, options.bloom_bits_per_value)?,
+        false => None,
+    };
+    let trigram = match options.trigram_filters.covers(field.name()) {
+        // The column's own size is the budget, so a filter never outweighs the
+        // data it describes.
+        true => trigram::build(
+            array,
+            options.bloom_bits_per_value,
+            array.get_array_memory_size(),
+        )?,
+        false => None,
+    };
+
+    // Bounds for each row range inside the segment. A scan then skips the
+    // ranges a predicate rules out, and hands on the rest.
+    let pages = page_zones(array, options.page_rows);
+
+    write_blocked_chunk(
+        bytes,
+        array,
+        encoded,
+        codec,
+        options,
+        bloom.as_ref(),
+        trigram.as_ref(),
+        pages.as_deref(),
+    )
 }
 
 /// How many pages of bounds a segment of `rows` rows holds.

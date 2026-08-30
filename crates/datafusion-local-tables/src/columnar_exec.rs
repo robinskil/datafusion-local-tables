@@ -20,7 +20,7 @@ use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{
-    BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -159,6 +159,74 @@ impl PageFilters {
             }
         }
         ruled_out.then_some(keep)
+    }
+}
+
+/// What one partition needs to turn a piece of work into batches.
+///
+/// This exists so the stream below captures one value instead of six. The
+/// stream clones it once per step, and every field inside is cheap to clone.
+#[derive(Clone)]
+struct Scanner {
+    table: ColumnarTable,
+    snapshot: Arc<Snapshot>,
+    projection: Option<Arc<Vec<usize>>>,
+    pruning: Arc<Pruning>,
+    /// The table's schema, not the projected one. Pruning names columns by
+    /// their position in the table.
+    schema: SchemaRef,
+    pages_pruned: Count,
+}
+
+impl Scanner {
+    /// Turn one piece of work into batches.
+    async fn run(&self, item: &Work) -> Result<Vec<RecordBatch>> {
+        match item {
+            Work::Segment(entry) => self.read(entry).await,
+            Work::Batch(batch) => self.project(batch),
+        }
+    }
+
+    /// Read the pages of a segment that a predicate leaves.
+    async fn read(&self, entry: &SegmentEntry) -> Result<Vec<RecordBatch>> {
+        let keep = self.keep_pages(entry).await?;
+        self.table
+            .read_segment_pages(
+                &self.snapshot,
+                entry,
+                self.projection.as_deref().map(|p| &p[..]),
+                keep.as_deref(),
+            )
+            .await
+            .map_err(to_df_error)
+    }
+
+    /// Which pages of a segment to read, or `None` for all of them.
+    ///
+    /// This opens the segment once. The bounds that choose the pages and the
+    /// bytes those pages hold come from the same reader.
+    async fn keep_pages(&self, entry: &SegmentEntry) -> Result<Option<Vec<bool>>> {
+        if self.pruning.pages.is_empty() {
+            return Ok(None);
+        }
+        let reader = self
+            .table
+            .segment_reader(entry)
+            .await
+            .map_err(to_df_error)?;
+        let keep = self.pruning.pages.keep_pages(&self.schema, &reader);
+        if let Some(keep) = &keep {
+            self.pages_pruned.add(keep.iter().filter(|k| !**k).count());
+        }
+        Ok(keep)
+    }
+
+    /// Cut an in-memory batch down to the projected columns.
+    fn project(&self, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
+        Ok(match self.projection.as_deref() {
+            Some(indices) => vec![batch.project(indices)?],
+            None => vec![batch.clone()],
+        })
     }
 }
 
@@ -351,68 +419,34 @@ impl ExecutionPlan for ColumnarScanExec {
             )));
         }
 
-        let table = self.table.clone();
-        let snapshot = self.snapshot.clone();
-        let projection = self.projection.clone();
-        let morsels = self.morsels.clone();
-        let pruning = self.pruning.clone();
-        let table_schema = self.table.schema();
         let baseline = BaselineMetrics::new(&self.metrics, partition);
-        let pages_pruned = MetricBuilder::new(&self.metrics).counter("pages_pruned", partition);
+        let scanner = Scanner {
+            table: self.table.clone(),
+            snapshot: self.snapshot.clone(),
+            projection: self.projection.clone(),
+            pruning: self.pruning.clone(),
+            schema: self.table.schema(),
+            pages_pruned: MetricBuilder::new(&self.metrics).counter("pages_pruned", partition),
+        };
+
         // Every partition draws from one budget, so a LIMIT stops the whole
-        // scan rather than each partition returning a limit's worth.
+        // scan. Each partition does not return a limit's worth of its own.
         let budget = self
             .limit
             .map(|limit| Arc::new(AtomicI64::new(limit as i64)));
 
-        // Each step takes the next piece of work still going, so a partition
-        // that draws a cheap segment comes straight back for another.
-        let stream = stream::try_unfold(morsels, move |morsels| {
-            let table = table.clone();
-            let snapshot = snapshot.clone();
-            let projection = projection.clone();
-            let pruning = pruning.clone();
-            let table_schema = table_schema.clone();
-            let pages_pruned = pages_pruned.clone();
-            async move {
+        // Each step takes the next piece of work still going. A partition that
+        // draws a cheap segment comes straight back for another.
+        let stream = stream::try_unfold(
+            (scanner, self.morsels.clone()),
+            |(scanner, morsels)| async move {
                 let Some(item) = morsels.take() else {
                     return Ok::<_, DataFusionError>(None);
                 };
-                let batches = match item {
-                    Work::Segment(entry) => {
-                        // The segment is opened once: the bounds that decide
-                        // which pages to keep and the bytes those pages hold
-                        // come from the same reader.
-                        let keep = match pruning.pages.is_empty() {
-                            true => None,
-                            false => {
-                                let reader =
-                                    table.segment_reader(entry).await.map_err(to_df_error)?;
-                                let keep = pruning.pages.keep_pages(&table_schema, &reader);
-                                if let Some(keep) = &keep {
-                                    pages_pruned.add(keep.iter().filter(|k| !**k).count());
-                                }
-                                keep
-                            }
-                        };
-                        table
-                            .read_segment_pages(
-                                &snapshot,
-                                entry,
-                                projection.as_deref().map(|p| &p[..]),
-                                keep.as_deref(),
-                            )
-                            .await
-                            .map_err(to_df_error)?
-                    }
-                    Work::Batch(batch) => match projection.as_deref() {
-                        Some(indices) => vec![batch.project(indices)?],
-                        None => vec![batch.clone()],
-                    },
-                };
-                Ok(Some((batches, morsels)))
-            }
-        })
+                let batches = scanner.run(item).await?;
+                Ok(Some((batches, (scanner, morsels))))
+            },
+        )
         .map_ok(|batches| stream::iter(batches.into_iter().map(Ok)))
         .try_flatten()
         .try_filter_map(move |batch| {

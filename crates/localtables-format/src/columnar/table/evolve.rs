@@ -130,104 +130,130 @@ impl ColumnarTable {
     /// converts it, and writes it under the new one. The new segments and the
     /// new schema land in one commit.
     pub(super) async fn set_schema(&self, schema: SchemaRef, rewrite: bool) -> Result<()> {
-        // Anything still in the memtable or the log is shaped by the old
-        // schema. Landing it first means the change only has segments to think
-        // about.
+        // Anything still in the memtable or the log carries the old schema.
+        // Land it first. The change then has only segments to think about.
         self.flush().await?;
 
         let before = self.table_schema();
         let after = Arc::new(TableSchema::new(schema, &self.inner.options.cluster_by)?);
-
         let snapshot = self.snapshot();
         let sources: Vec<SegmentEntry> = snapshot.live_segments().cloned().collect();
 
         let mut writer = self.inner.writer.lock().await;
         if !writer.memtable.is_empty() {
             // A write landed between the flush above and this lock. Its rows
-            // are shaped by the old schema, so the change is abandoned rather
-            // than committed over them.
+            // carry the old schema. Abandon the change rather than commit over
+            // them.
             return Err(Error::InvalidArgument(
                 "a write landed while the schema was changing; try again".into(),
             ));
         }
+
         let mut manifest = writer.file.manifest().clone();
         manifest.txn_id = writer.file.meta().txn_id + 1;
         manifest.schema = writer.file.write_schema(&after.schema).await?;
-        let min_active = self.inner.registry.min_active_txn();
 
         if rewrite {
-            // Read under the old schema and write under the new one, a run of
-            // segments at a time rather than the whole table at once. The
-            // conversion has to reach disk in the same commit as the schema, so
-            // this cannot be split across commits the way compaction is; what
-            // it can do is bound what it holds while it works.
-            //
-            // The reads happen under the writer lock, unlike compaction's. A
-            // schema change already refuses to run alongside a write, so there
-            // is nothing to yield the lock for.
-            let budget = self.inner.options.compaction_max_bytes.max(1);
-            let rows: u64 = sources.iter().map(|entry| entry.row_count).sum();
-            let group_rows = self.inner.options.row_group_size_for(rows);
-
-            let written = async {
-                let mut pending: Vec<RecordBatch> = Vec::new();
-                let mut pending_bytes = 0u64;
-                for entry in &sources {
-                    for batch in self
-                        .read_segment_as(&snapshot, entry, None, &before, None)
-                        .await?
-                    {
-                        pending.push(convert(&batch, &before.schema, &after.schema)?);
-                    }
-                    pending_bytes += entry.data.len;
-                    if pending_bytes < budget {
-                        continue;
-                    }
-                    for group in
-                        self.row_groups(std::mem::take(&mut pending), group_rows, &after)?
-                    {
-                        self.write_segment(&writer.file, &mut manifest, &group, &after, min_active)
-                            .await?;
-                    }
-                    pending_bytes = 0;
-                }
-                for group in self.row_groups(pending, group_rows, &after)? {
-                    self.write_segment(&writer.file, &mut manifest, &group, &after, min_active)
-                        .await?;
-                }
-                Ok::<(), Error>(())
-            }
-            .await;
-            written?;
-
-            manifest
-                .segments
-                .retain(|entry| !sources.iter().any(|s| s.segment_id == entry.segment_id));
-            for entry in &sources {
-                manifest.free(entry.data);
-                if let Some(dv) = entry.deletes {
-                    manifest.free(dv);
-                }
-                writer.deletes.remove(&entry.segment_id);
-                writer.dirty_deletes.remove(&entry.segment_id);
-            }
+            self.convert_segments(&writer, &mut manifest, &snapshot, &sources, &before, &after)
+                .await?;
+            retire(&mut writer, &mut manifest, &sources);
         }
 
-        match self.commit(&mut writer, manifest).await {
-            Ok(()) => {
-                // Three places hold the schema besides the manifest, and all of
-                // them have to move together with it: the file, which is what a
-                // snapshot copies; the memtable, which the next insert is
-                // checked against and which a scan projects alongside the
-                // segments; and the handle readers load from.
-                writer.file.set_schema(after.schema.clone());
-                writer.memtable = Memtable::new(after.schema.clone(), writer.memtable.next_seqno());
-                self.inner.schema.store(after);
-                self.publish(&writer)?;
-                Ok(())
+        self.commit(&mut writer, manifest).await?;
+        self.adopt_schema(&mut writer, after)
+    }
+
+    /// Read every live row under `before` and write it back under `after`.
+    ///
+    /// This works a run of segments at a time, not the whole table at once. The
+    /// conversion must reach disk in the same commit as the schema, so it
+    /// cannot split across commits the way compaction does. What it can do is
+    /// bound what it holds while it works.
+    ///
+    /// The reads happen under the writer lock, unlike compaction's. A schema
+    /// change already refuses to run beside a write, so there is nothing to
+    /// yield the lock for.
+    async fn convert_segments(
+        &self,
+        writer: &Writer,
+        manifest: &mut Manifest,
+        snapshot: &Snapshot,
+        sources: &[SegmentEntry],
+        before: &TableSchema,
+        after: &Arc<TableSchema>,
+    ) -> Result<()> {
+        let budget = self.inner.options.compaction_max_bytes.max(1);
+        let rows: u64 = sources.iter().map(|entry| entry.row_count).sum();
+        let group_rows = self.inner.options.row_group_size_for(rows);
+        let min_active = self.inner.registry.min_active_txn();
+
+        let mut pending: Vec<RecordBatch> = Vec::new();
+        let mut pending_bytes = 0u64;
+        for entry in sources {
+            for batch in self
+                .read_segment_as(snapshot, entry, None, before, None)
+                .await?
+            {
+                pending.push(convert(&batch, &before.schema, &after.schema)?);
             }
-            Err(error) => Err(error),
+            pending_bytes += entry.data.len;
+            if pending_bytes < budget {
+                continue;
+            }
+            let ready = std::mem::take(&mut pending);
+            self.write_groups(writer, manifest, ready, group_rows, after, min_active)
+                .await?;
+            pending_bytes = 0;
         }
+        self.write_groups(writer, manifest, pending, group_rows, after, min_active)
+            .await
+    }
+
+    /// Cut batches into row groups and write each one as a segment.
+    async fn write_groups(
+        &self,
+        writer: &Writer,
+        manifest: &mut Manifest,
+        batches: Vec<RecordBatch>,
+        group_rows: usize,
+        schema: &Arc<TableSchema>,
+        min_active: u64,
+    ) -> Result<()> {
+        for group in self.row_groups(batches, group_rows, schema)? {
+            self.write_segment(&writer.file, manifest, &group, schema, min_active)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Put the new schema where every reader of it looks.
+    ///
+    /// Three places hold the schema besides the manifest, and all three must
+    /// move with it. The file is what a snapshot copies. The memtable is what
+    /// the next insert is checked against, and what a scan projects beside the
+    /// segments. The handle is what readers load from.
+    fn adopt_schema(&self, writer: &mut Writer, after: Arc<TableSchema>) -> Result<()> {
+        writer.file.set_schema(after.schema.clone());
+        writer.memtable = Memtable::new(after.schema.clone(), writer.memtable.next_seqno());
+        self.inner.schema.store(after);
+        self.publish(writer)
+    }
+}
+
+/// Drop the rewritten segments from the manifest and free their bytes.
+///
+/// They become garbage as of this commit, not before it.
+fn retire(writer: &mut Writer, manifest: &mut Manifest, sources: &[SegmentEntry]) {
+    manifest
+        .segments
+        .retain(|entry| !sources.iter().any(|s| s.segment_id == entry.segment_id));
+    for entry in sources {
+        manifest.free(entry.data);
+        if let Some(dv) = entry.deletes {
+            manifest.free(dv);
+        }
+        writer.deletes.remove(&entry.segment_id);
+        writer.dirty_deletes.remove(&entry.segment_id);
     }
 }
 

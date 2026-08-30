@@ -6,20 +6,20 @@
 //!
 //! ```no_run
 //! use datafusion::prelude::SessionContext;
-//! use datafusion_local_tables::{ColumnarTableProvider, format::TableOptions};
-//! use localtables_format::ColumnarTable;
-//! use std::sync::Arc;
+//! use datafusion_local_tables::{register_columnar_table, TableOptions};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let table = ColumnarTable::open("orders.lt".as_ref(), TableOptions::default()).await?;
 //! let ctx = SessionContext::new();
-//! ctx.register_table("orders", Arc::new(ColumnarTableProvider::new(table)))?;
+//! register_columnar_table(&ctx, "orders", "orders.lt".as_ref(), TableOptions::default())
+//!     .await?;
 //!
-//! let df = ctx.sql("SELECT * FROM orders WHERE id > 100").await?;
-//! df.show().await?;
+//! ctx.sql("SELECT * FROM orders WHERE id > 100").await?.show().await?;
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! Everything a caller needs is re-exported here. A dependency on
+//! `localtables-format` is not required.
 
 pub mod columnar_exec;
 pub mod columnar_provider;
@@ -30,4 +30,8 @@ pub use columnar_exec::ColumnarScanExec;
 pub use columnar_provider::{register_columnar_table, ColumnarTableProvider};
 pub use dml::{ColumnarDataSink, DmlExec};
 pub use localtables_format as format;
-pub use localtables_format::ColumnarTable;
+// Re-exported so a caller needs one crate and one `use` line. The options and
+// the table itself both live in the format crate.
+pub use localtables_format::{
+    BloomFilters, ColumnarTable, Compression, Durability, IoBackend, TableOptions,
+};

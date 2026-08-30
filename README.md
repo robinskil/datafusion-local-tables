@@ -75,21 +75,18 @@ lookups. It was removed. This build cannot open a file that version wrote.
 
 ```rust
 use datafusion::prelude::SessionContext;
-use datafusion_local_tables::ColumnarTableProvider;
-use localtables_format::{BloomFilters, ColumnarTable, TableOptions};
-use std::sync::Arc;
+use datafusion_local_tables::{register_columnar_table, BloomFilters, TableOptions};
 
 async fn example() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
 
-    // `user_id` is looked up by equality, so it gets a membership filter.
+    // Queries look `user_id` up by equality, so it gets a membership filter.
     let options = TableOptions::default()
         .with_bloom_filters(BloomFilters::Columns(vec!["user_id".to_string()]));
 
-    let events = ColumnarTable::open("events.lt".as_ref(), options).await?;
-    ctx.register_table("events", Arc::new(ColumnarTableProvider::new(events)))?;
+    register_columnar_table(&ctx, "events", "events.lt".as_ref(), options).await?;
 
-    // The range prunes by zone map, the equality by membership filter.
+    // The range prunes by zone map. The equality prunes by membership filter.
     ctx.sql(
         "SELECT count(*) FROM events \
          WHERE ts > 1700000000 AND user_id = 8143",
