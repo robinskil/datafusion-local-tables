@@ -6,12 +6,10 @@
 use super::*;
 
 impl ColumnarTable {
-
     /// Open a segment for reading, keeping its bytes alive through the reader.
     pub async fn segment_reader(&self, entry: &SegmentEntry) -> Result<SegmentReader> {
         self.segment_reader_as(entry, &self.table_schema()).await
     }
-
 
     /// Open a segment under a schema that is not necessarily the current one.
     ///
@@ -33,7 +31,6 @@ impl ColumnarTable {
         )
     }
 
-
     /// Read one segment as batches, with deleted rows removed.
     pub async fn read_segment(
         &self,
@@ -44,7 +41,6 @@ impl ColumnarTable {
         self.read_segment_as(snapshot, entry, projection, &self.table_schema(), None)
             .await
     }
-
 
     /// Read a segment, keeping only the pages a caller still wants.
     ///
@@ -68,7 +64,6 @@ impl ColumnarTable {
         )
         .await
     }
-
 
     pub(super) async fn read_segment_as(
         &self,
@@ -117,7 +112,6 @@ impl ColumnarTable {
         }
         Ok(out)
     }
-
 
     /// Read the whole table as batches, segments first and then the rows still
     /// held in memory.
@@ -171,7 +165,10 @@ pub(super) fn kept_ranges(reader: &SegmentReader, keep: &[bool]) -> Result<Vec<(
 /// Decoding a range that spans blocks means joining the results, which copies.
 /// Handing back one piece per block avoids that: the scan returns several
 /// batches instead of one, which it was going to do anyway.
-pub(super) fn split_at_blocks(ranges: Vec<(usize, usize)>, block_rows: usize) -> Vec<(usize, usize)> {
+pub(super) fn split_at_blocks(
+    ranges: Vec<(usize, usize)>,
+    block_rows: usize,
+) -> Vec<(usize, usize)> {
     if block_rows == 0 {
         return ranges;
     }

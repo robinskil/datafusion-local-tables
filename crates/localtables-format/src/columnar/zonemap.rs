@@ -1,17 +1,17 @@
 //! Per-column bounds, used to skip segments a query cannot match.
 //!
-//! A zone map holds the smallest and largest value in a column chunk plus its
-//! null count. A predicate that falls outside those bounds cannot match any row
-//! in the chunk, so the scan skips it without reading a byte of its data.
+//! A zone map holds the smallest and largest value in a column chunk. It also
+//! holds the null count. A predicate outside those bounds matches no row in the
+//! chunk. The scan then skips the chunk and reads none of its data.
 //!
 //! Bounds are stored as raw value bytes and are read back against the column's
 //! declared type. Long strings and binary are truncated, which changes what the
 //! bounds mean:
 //!
-//! * a truncated minimum is still a valid lower bound, because chopping bytes
-//!   off the end of a string can only make it smaller or equal;
-//! * a truncated maximum is *not* a valid upper bound, so it is reported as
-//!   unknown unless the truncated form can be rounded up to one.
+//! * A truncated minimum is still a valid lower bound. To cut bytes off the
+//!   end of a string can only make it smaller or equal.
+//! * A truncated maximum is *not* a valid upper bound. The zone map reports it
+//!   as unknown, unless the truncated form rounds up to one.
 //!
 //! Reporting an unknown bound costs a segment read. Reporting a wrong one loses
 //! rows, so the rule never guesses.
@@ -212,9 +212,9 @@ fn bounds(array: &dyn Array) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
             )
         }
 
-        // A dictionary's bounds come from its values. Values the keys never
-        // reference widen the bounds rather than narrowing them, so the result
-        // still contains every value present, which is all a bound must do.
+        // A dictionary's bounds come from its values. A value the keys never
+        // reference widens the bounds; it never narrows them. The result still
+        // holds every value present, which is all a bound must do.
         DataType::Dictionary(_, _) => {
             let values = array.to_data().child_data()[0].clone();
             bounds(arrow_array::make_array(values).as_ref())

@@ -16,8 +16,8 @@ pub mod error;
 pub mod io;
 pub mod layout;
 pub mod snapshot;
-pub mod valuecodec;
 pub mod table_file;
+pub mod valuecodec;
 pub mod wal;
 
 pub use columnar::ColumnarTable;

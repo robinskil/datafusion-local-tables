@@ -48,7 +48,9 @@ async fn table(dir: &tempfile::TempDir, filters: BloomFilters) -> SessionContext
     .unwrap();
 
     for segment in 0..SEGMENTS {
-        let ids: Vec<i64> = (0..PER_SEGMENT).map(|r| segment * PER_SEGMENT + r).collect();
+        let ids: Vec<i64> = (0..PER_SEGMENT)
+            .map(|r| segment * PER_SEGMENT + r)
+            .collect();
         let bodies: Vec<String> = (0..PER_SEGMENT).map(|r| body_of(segment, r)).collect();
         let batch = RecordBatch::try_new(
             schema(),
@@ -69,7 +71,9 @@ async fn table(dir: &tempfile::TempDir, filters: BloomFilters) -> SessionContext
 }
 
 fn pruned(plan: &str) -> usize {
-    let at = plan.find("pruned=").expect("the scan reports what it pruned");
+    let at = plan
+        .find("pruned=")
+        .expect("the scan reports what it pruned");
     plan[at + "pruned=".len()..]
         .chars()
         .take_while(char::is_ascii_digit)

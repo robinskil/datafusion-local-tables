@@ -143,7 +143,12 @@ mod tests {
     use super::*;
 
     fn header() -> FileHeader {
-        FileHeader::new(TableKind::Columnar, [7u8; 16], Extent::new(4096, 128), 0xabcd)
+        FileHeader::new(
+            TableKind::Columnar,
+            [7u8; 16],
+            Extent::new(4096, 128),
+            0xabcd,
+        )
     }
 
     /// Read a header back the way an open does, so `validate` sees an archive
@@ -169,10 +174,7 @@ mod tests {
             ..header()
         };
         let err = validate(&older).unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported(_)),
-            "got {err:?}"
-        );
+        assert!(matches!(err, crate::Error::Unsupported(_)), "got {err:?}");
     }
 
     #[test]

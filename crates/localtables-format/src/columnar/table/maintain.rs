@@ -6,7 +6,6 @@
 use super::*;
 
 impl ColumnarTable {
-
     /// Rewrite the segments deletes have hollowed out.
     ///
     /// A deleted row still occupies its bytes until the segment is rewritten
@@ -24,7 +23,6 @@ impl ColumnarTable {
         }
         self.compact_segments(&targets).await
     }
-
 
     /// Rewrite every segment with the options this handle holds.
     ///
@@ -44,7 +42,6 @@ impl ColumnarTable {
             .collect();
         self.compact_segments(&segment_ids).await
     }
-
 
     /// Rewrite the named segments, dropping their deleted rows.
     ///
@@ -70,13 +67,16 @@ impl ColumnarTable {
         Ok(rows)
     }
 
-
     /// Cut segments into runs that each fit the memory budget.
     ///
     /// A run always holds at least one segment, so a segment larger than the
     /// budget is a run on its own rather than an error: one segment is the
     /// smallest unit a rewrite can work in.
-    pub(super) fn runs(&self, snapshot: &Snapshot, segment_ids: &[SegmentId]) -> Result<Vec<Vec<SegmentId>>> {
+    pub(super) fn runs(
+        &self,
+        snapshot: &Snapshot,
+        segment_ids: &[SegmentId],
+    ) -> Result<Vec<Vec<SegmentId>>> {
         let budget = self.inner.options.compaction_max_bytes.max(1);
         let mut runs: Vec<Vec<SegmentId>> = Vec::new();
         let mut bytes = 0u64;
@@ -101,7 +101,6 @@ impl ColumnarTable {
         }
         Ok(runs)
     }
-
 
     pub(super) async fn compact_run(&self, segment_ids: &[SegmentId]) -> Result<u64> {
         if segment_ids.is_empty() {
@@ -178,7 +177,6 @@ impl ColumnarTable {
         self.commit(&mut writer, manifest).await?;
         Ok(rows)
     }
-
 
     /// Segments worth rewriting, because deletes now dominate them.
     pub fn compaction_candidates(&self, dead_ratio: f64) -> Vec<SegmentId> {

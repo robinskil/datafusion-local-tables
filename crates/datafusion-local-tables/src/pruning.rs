@@ -192,7 +192,10 @@ impl PruningStatistics for PageStatistics {
     fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
         let (zones, _) = self.zones(column)?;
         Some(Arc::new(UInt64Array::from(
-            zones.iter().map(|zone| zone.null_count).collect::<Vec<u64>>(),
+            zones
+                .iter()
+                .map(|zone| zone.null_count)
+                .collect::<Vec<u64>>(),
         )))
     }
 

@@ -1008,7 +1008,10 @@ async fn a_segment_written_before_a_column_existed_reads_it_as_null() {
     );
     // The columns that were written are untouched.
     assert_eq!(
-        full.column(0).as_any().downcast_ref::<Int32Array>().unwrap(),
+        full.column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap(),
         &Int32Array::from(vec![1, 2, 3])
     );
 
@@ -1021,7 +1024,11 @@ async fn a_segment_written_before_a_column_existed_reads_it_as_null() {
     assert_eq!(mixed.num_columns(), 2);
     assert_eq!(mixed.column(0).null_count(), 3);
     assert_eq!(
-        mixed.column(1).as_any().downcast_ref::<Int32Array>().unwrap(),
+        mixed
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap(),
         &Int32Array::from(vec![1, 2, 3])
     );
 
@@ -1038,11 +1045,7 @@ async fn a_segment_with_columns_the_schema_lost_is_refused() {
         Field::new("id", DataType::Int32, false),
         Field::new("name", DataType::Utf8, true),
     ]));
-    let after: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-        "id",
-        DataType::Int32,
-        false,
-    )]));
+    let after: SchemaRef = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
 
     let batch = RecordBatch::try_new(
         before.clone(),
@@ -1077,11 +1080,7 @@ async fn a_segment_with_columns_the_schema_lost_is_refused() {
 /// predicate rules out rather than hand on the whole segment.
 #[tokio::test]
 async fn a_segment_records_bounds_for_each_of_its_pages() {
-    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-        "id",
-        DataType::Int32,
-        false,
-    )]));
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     // Ten pages of a hundred, with ids running in order so each page covers a
     // narrow, distinct range.
     let batch = RecordBatch::try_new(
@@ -1116,11 +1115,7 @@ async fn a_segment_records_bounds_for_each_of_its_pages() {
 /// repeat the chunk's own zone map.
 #[tokio::test]
 async fn a_segment_of_one_page_records_no_page_bounds() {
-    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-        "id",
-        DataType::Int32,
-        false,
-    )]));
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(Int32Array::from((0..50).collect::<Vec<i32>>()))],
@@ -1140,11 +1135,7 @@ async fn a_segment_of_one_page_records_no_page_bounds() {
 
 #[tokio::test]
 async fn switching_pages_off_records_none() {
-    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-        "id",
-        DataType::Int32,
-        false,
-    )]));
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(Int32Array::from((0..1000).collect::<Vec<i32>>()))],
@@ -1163,11 +1154,7 @@ async fn switching_pages_off_records_none() {
 /// A last page shorter than the rest is still covered.
 #[tokio::test]
 async fn a_ragged_last_page_is_covered() {
-    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-        "id",
-        DataType::Int32,
-        false,
-    )]));
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(Int32Array::from((0..250).collect::<Vec<i32>>()))],
@@ -1307,11 +1294,7 @@ async fn decoding_a_range_matches_decoding_everything_and_slicing() {
 
 #[tokio::test]
 async fn a_range_outside_the_segment_is_refused() {
-    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-        "id",
-        DataType::Int32,
-        false,
-    )]));
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(Int32Array::from((0..100).collect::<Vec<i32>>()))],
@@ -1323,18 +1306,17 @@ async fn a_range_outside_the_segment_is_refused() {
     assert!(reader.read_rows(None, 0, 101).is_err());
     assert!(reader.read_rows(None, 100, 1).is_err());
     assert!(reader.read_rows(None, 101, 0).is_err());
-    assert!(reader.read_rows(None, 100, 0).is_ok(), "the empty tail is a valid range");
+    assert!(
+        reader.read_rows(None, 100, 0).is_ok(),
+        "the empty tail is a valid range"
+    );
 }
 
 /// A projection of nothing still has to carry the range's row count, or a
 /// count-only query over skipped pages would come out wrong.
 #[tokio::test]
 async fn a_count_only_read_of_a_range_carries_its_rows() {
-    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-        "id",
-        DataType::Int32,
-        false,
-    )]));
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(Int32Array::from((0..100).collect::<Vec<i32>>()))],
@@ -1353,14 +1335,12 @@ async fn a_count_only_read_of_a_range_carries_its_rows() {
 /// right; only the saving is absent.
 #[tokio::test]
 async fn a_range_of_a_compressed_chunk_is_still_correct() {
-    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-        "id",
-        DataType::Int64,
-        false,
-    )]));
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let batch = RecordBatch::try_new(
         schema.clone(),
-        vec![Arc::new(Int64Array::from((0..1000i64).collect::<Vec<i64>>()))],
+        vec![Arc::new(Int64Array::from(
+            (0..1000i64).collect::<Vec<i64>>(),
+        ))],
     )
     .unwrap();
     let opts = options(Compression::Lz4, false);
@@ -1375,19 +1355,12 @@ async fn a_range_of_a_compressed_chunk_is_still_correct() {
 /// own. The answer must not depend on where the block boundaries fall.
 #[tokio::test]
 async fn a_blocked_column_returns_the_same_rows_as_an_unblocked_one() {
-    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-        "body",
-        DataType::Utf8,
-        true,
-    )]));
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));
     let bodies: Vec<Option<String>> = (0..5_000)
         .map(|i| (i % 11 != 0).then(|| format!("user{i}@example.com some padding text")))
         .collect();
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(StringArray::from(bodies))],
-    )
-    .unwrap();
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(bodies))]).unwrap();
 
     let unblocked = TableOptions {
         compression: Compression::Lz4,
@@ -1440,14 +1413,12 @@ async fn a_blocked_column_returns_the_same_rows_as_an_unblocked_one() {
 /// it would cost the zero-copy read path and save nothing.
 #[tokio::test]
 async fn an_uncompressed_column_is_never_blocked() {
-    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-        "id",
-        DataType::Int64,
-        false,
-    )]));
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let batch = RecordBatch::try_new(
         schema.clone(),
-        vec![Arc::new(Int64Array::from((0..5_000i64).collect::<Vec<i64>>()))],
+        vec![Arc::new(Int64Array::from(
+            (0..5_000i64).collect::<Vec<i64>>(),
+        ))],
     )
     .unwrap();
 
@@ -1466,17 +1437,10 @@ async fn an_uncompressed_column_is_never_blocked() {
 /// decompression or the other way round.
 #[tokio::test]
 async fn block_size_and_page_size_are_independent() {
-    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-        "body",
-        DataType::Utf8,
-        false,
-    )]));
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)]));
     let bodies: Vec<String> = (0..4_000).map(|i| format!("row {i} padding")).collect();
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(StringArray::from(bodies))],
-    )
-    .unwrap();
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(bodies))]).unwrap();
 
     let opts = TableOptions {
         compression: Compression::Lz4,
@@ -1516,7 +1480,10 @@ async fn uncompressed_variable_width_columns_are_blocked_and_numbers_are_not() {
     ]));
     let ids: Vec<i64> = (0..4_000).collect();
     let bodies: Vec<String> = ids.iter().map(|i| format!("row {i} padding")).collect();
-    let blobs: Vec<Vec<u8>> = ids.iter().map(|i| format!("blob {i}").into_bytes()).collect();
+    let blobs: Vec<Vec<u8>> = ids
+        .iter()
+        .map(|i| format!("blob {i}").into_bytes())
+        .collect();
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
@@ -1561,17 +1528,10 @@ async fn uncompressed_variable_width_columns_are_blocked_and_numbers_are_not() {
 /// one contiguous array should get.
 #[tokio::test]
 async fn a_block_size_of_zero_leaves_every_column_whole() {
-    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-        "body",
-        DataType::Utf8,
-        false,
-    )]));
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)]));
     let bodies: Vec<String> = (0..4_000).map(|i| format!("row {i}")).collect();
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(StringArray::from(bodies))],
-    )
-    .unwrap();
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(bodies))]).unwrap();
 
     let opts = TableOptions {
         compression_block_rows: 0,

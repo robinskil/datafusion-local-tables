@@ -21,13 +21,13 @@ use arrow_schema::{DataType, Schema, SchemaRef};
 use std::sync::Arc;
 
 use crate::columnar::bloom::BloomFilter;
-use crate::columnar::trigram;
-use crate::columnar::zonemap::ZoneMap;
 use crate::columnar::decode::{decode_column, decode_column_rows, BufferSource, SegmentBytes};
 use crate::columnar::encode::{compress_buffers, encode_column, EncodedColumn};
 use crate::columnar::page::{
     ArchivedSegmentMeta, BufferRole, BufferSpec, Codec, ColumnChunk, SegmentMeta,
 };
+use crate::columnar::trigram;
+use crate::columnar::zonemap::ZoneMap;
 use crate::config::TableOptions;
 use crate::io::buf::SharedBuf;
 use crate::layout::frame::{self, tag};

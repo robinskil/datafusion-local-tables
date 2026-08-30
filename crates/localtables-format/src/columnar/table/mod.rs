@@ -27,10 +27,10 @@ use crate::columnar::delete_vector::DeleteVector;
 use crate::columnar::memtable::Memtable;
 use crate::columnar::segment::{build_segment, SegmentReader};
 use crate::columnar::zorder;
-use crate::layout::schema::SchemaLayout;
 use crate::config::TableOptions;
 use crate::io::FileIo;
 use crate::layout::manifest::{Manifest, SegmentEntry, SegmentId};
+use crate::layout::schema::SchemaLayout;
 use crate::layout::{TableKind, BUFFER_ALIGN, SEGMENT_ALIGN};
 use crate::snapshot::{Snapshot, SnapshotRegistry};
 use crate::table_file::TableFile;
@@ -157,7 +157,10 @@ impl ColumnarTable {
 
     pub(super) async fn from_file(file: TableFile) -> Result<Self> {
         let schema = file.schema().clone();
-        let table_schema = Arc::new(TableSchema::new(schema.clone(), &file.options().cluster_by)?);
+        let table_schema = Arc::new(TableSchema::new(
+            schema.clone(),
+            &file.options().cluster_by,
+        )?);
 
         let io = file.io().clone();
         let options = file.options().clone();

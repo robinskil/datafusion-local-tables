@@ -129,8 +129,14 @@ fn round_trip(schema: &SchemaRef, batch: &RecordBatch, opts: &TableOptions) -> R
         let io = open_backend(&path, opts.io_backend, opts.durability, false).unwrap();
 
         let layout = schema_codec::SchemaLayout::of(schema);
-        let built =
-            build_segment(0, schema, layout.current(), std::slice::from_ref(batch), opts).unwrap();
+        let built = build_segment(
+            0,
+            schema,
+            layout.current(),
+            std::slice::from_ref(batch),
+            opts,
+        )
+        .unwrap();
 
         io.set_len(SEGMENT_ALIGN).await.unwrap();
         let offset = io.append(&[&built.bytes]).await.unwrap();

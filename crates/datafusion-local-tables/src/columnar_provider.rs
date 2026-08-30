@@ -19,8 +19,8 @@ use localtables_format::columnar::table::ColumnarTable;
 use localtables_format::layout::manifest::SegmentEntry;
 
 use crate::columnar_exec::{to_df_error, ColumnarScanExec};
-use crate::dml::{compile_assignments, compile_predicate, ColumnarDataSink, DmlExec};
 use crate::columnar_exec::{PageFilters, Pruning};
+use crate::dml::{compile_assignments, compile_predicate, ColumnarDataSink, DmlExec};
 use crate::pruning::{substring_requirements, SegmentStatistics, SegmentZoneMaps};
 
 /// Exposes a [`ColumnarTable`] to DataFusion.
@@ -200,7 +200,9 @@ impl ColumnarTableProvider {
         filters
             .iter()
             .filter_map(|filter| {
-                let physical = state.create_physical_expr(filter.clone(), &df_schema).ok()?;
+                let physical = state
+                    .create_physical_expr(filter.clone(), &df_schema)
+                    .ok()?;
                 PruningPredicateBuilder::new()
                     .with_file_schema(schema.clone())
                     .build(physical)
@@ -243,8 +245,9 @@ impl ColumnarTableProvider {
         let mut zone_maps = Vec::with_capacity(candidates.len());
         for entry in candidates {
             let reader = self.table.segment_reader(entry).await.ok()?;
-            zone_maps
-                .push(SegmentZoneMaps::from_reader(&reader, &bloom_columns, &trigram_columns).ok()?);
+            zone_maps.push(
+                SegmentZoneMaps::from_reader(&reader, &bloom_columns, &trigram_columns).ok()?,
+            );
         }
         let statistics = SegmentStatistics::new(schema.clone(), zone_maps);
 

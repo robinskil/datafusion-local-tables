@@ -6,7 +6,6 @@
 use super::*;
 
 impl ColumnarTable {
-
     // ---- Schema changes -------------------------------------------------
     //
     // Two shapes.
@@ -50,16 +49,15 @@ impl ColumnarTable {
         self.set_schema(schema_with(&current, fields), false).await
     }
 
-
     /// Rename a column.
     ///
     /// Nothing is rewritten. A segment's bytes mean what its column *types*
     /// say, so a name is not part of what makes them readable.
     pub async fn rename_column(&self, from: &str, to: &str) -> Result<()> {
         let current = self.schema();
-        let at = current.index_of(from).map_err(|_| {
-            Error::InvalidArgument(format!("the table has no column named {from}"))
-        })?;
+        let at = current
+            .index_of(from)
+            .map_err(|_| Error::InvalidArgument(format!("the table has no column named {from}")))?;
         if from != to && current.index_of(to).is_ok() {
             return Err(Error::InvalidArgument(format!(
                 "the table already has a column named {to}"
@@ -71,7 +69,6 @@ impl ColumnarTable {
         self.set_schema(schema_with(&current, fields), false).await
     }
 
-
     /// Drop a column.
     ///
     /// Rewrites every segment, which is also what reclaims the column's bytes.
@@ -79,9 +76,9 @@ impl ColumnarTable {
     /// something rewrote the table anyway.
     pub async fn drop_column(&self, name: &str) -> Result<()> {
         let current = self.schema();
-        let at = current.index_of(name).map_err(|_| {
-            Error::InvalidArgument(format!("the table has no column named {name}"))
-        })?;
+        let at = current
+            .index_of(name)
+            .map_err(|_| Error::InvalidArgument(format!("the table has no column named {name}")))?;
         if current.fields().len() == 1 {
             return Err(Error::InvalidArgument(
                 "cannot drop the last column of a table".into(),
@@ -92,7 +89,6 @@ impl ColumnarTable {
         fields.remove(at);
         self.set_schema(schema_with(&current, fields), true).await
     }
-
 
     /// Change a column's type.
     ///
@@ -107,9 +103,9 @@ impl ColumnarTable {
     /// does not commit nulls in place of data.
     pub async fn cast_column(&self, name: &str, to: DataType) -> Result<()> {
         let current = self.schema();
-        let at = current.index_of(name).map_err(|_| {
-            Error::InvalidArgument(format!("the table has no column named {name}"))
-        })?;
+        let at = current
+            .index_of(name)
+            .map_err(|_| Error::InvalidArgument(format!("the table has no column named {name}")))?;
         if current.field(at).data_type() == &to {
             return Ok(());
         }
@@ -124,7 +120,6 @@ impl ColumnarTable {
         fields[at] = Arc::new(Field::new(name, to, fields[at].is_nullable()));
         self.set_schema(schema_with(&current, fields), true).await
     }
-
 
     /// Commit a new schema, rewriting the data first when it has to.
     ///
@@ -226,8 +221,7 @@ impl ColumnarTable {
                 // checked against and which a scan projects alongside the
                 // segments; and the handle readers load from.
                 writer.file.set_schema(after.schema.clone());
-                writer.memtable =
-                    Memtable::new(after.schema.clone(), writer.memtable.next_seqno());
+                writer.memtable = Memtable::new(after.schema.clone(), writer.memtable.next_seqno());
                 self.inner.schema.store(after);
                 self.publish(&writer)?;
                 Ok(())
@@ -247,7 +241,11 @@ pub(super) fn schema_with(schema: &SchemaRef, fields: Vec<FieldRef>) -> SchemaRe
 /// Columns are matched by name, so dropping one leaves the rest where they
 /// belong rather than shifting them. A column the old schema does not have is
 /// filled with nulls, which is the same thing an added column means.
-pub(super) fn convert(batch: &RecordBatch, before: &SchemaRef, after: &SchemaRef) -> Result<RecordBatch> {
+pub(super) fn convert(
+    batch: &RecordBatch,
+    before: &SchemaRef,
+    after: &SchemaRef,
+) -> Result<RecordBatch> {
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(after.fields().len());
     for field in after.fields() {
         let column = match before.index_of(field.name()) {

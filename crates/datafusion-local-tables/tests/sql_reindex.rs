@@ -39,7 +39,9 @@ fn options() -> TableOptions {
 /// Segment `k` holds keys scattered across the whole range, so no zone map
 /// rules any of them out, and text of its own, so a substring search can.
 async fn seed(path: &std::path::Path) {
-    let table = ColumnarTable::create(path, schema(), options()).await.unwrap();
+    let table = ColumnarTable::create(path, schema(), options())
+        .await
+        .unwrap();
     for segment in 0..SEGMENTS {
         let keys: Vec<i64> = (0..PER_SEGMENT).map(|r| segment + r * SEGMENTS).collect();
         let bodies: Vec<String> = keys
@@ -60,7 +62,9 @@ async fn seed(path: &std::path::Path) {
 }
 
 fn pruned(plan: &str) -> usize {
-    let at = plan.find("pruned=").expect("the scan reports what it pruned");
+    let at = plan
+        .find("pruned=")
+        .expect("the scan reports what it pruned");
     plan[at + "pruned=".len()..]
         .chars()
         .take_while(char::is_ascii_digit)
@@ -200,7 +204,11 @@ async fn a_table_gains_a_clustered_order_by_being_rewritten() {
     .await
     .unwrap();
 
-    assert_eq!(prunes(&table, POINT).await, 0, "keys are scattered as written");
+    assert_eq!(
+        prunes(&table, POINT).await,
+        0,
+        "keys are scattered as written"
+    );
     table.rewrite_all().await.unwrap();
     assert!(
         prunes(&table, POINT).await >= 8,
@@ -243,7 +251,9 @@ async fn clustering_by_one_column_scatters_another() {
 async fn rewriting_an_empty_table_does_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.lt");
-    let table = ColumnarTable::create(&path, schema(), options()).await.unwrap();
+    let table = ColumnarTable::create(&path, schema(), options())
+        .await
+        .unwrap();
     assert_eq!(table.rewrite_all().await.unwrap(), 0);
 }
 

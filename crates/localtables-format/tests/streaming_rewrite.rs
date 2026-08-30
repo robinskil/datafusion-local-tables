@@ -200,7 +200,10 @@ async fn compacting_a_subset_leaves_the_rest_alone() {
 
     let after = segment_ids(&table);
     for untouched in &all[all.len() / 2..] {
-        assert!(after.contains(untouched), "segment {untouched} was rewritten");
+        assert!(
+            after.contains(untouched),
+            "segment {untouched} was rewritten"
+        );
     }
     assert_eq!(ids(&table).await, all_ids());
 }

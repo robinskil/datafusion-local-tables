@@ -108,7 +108,10 @@ async fn an_added_column_reads_as_null_for_rows_that_predate_it() {
 
     assert_eq!(table.schema().fields().len(), 3);
     let batches = rows(&table).await;
-    let nulls: usize = column(&batches, "score").iter().map(|a| a.null_count()).sum();
+    let nulls: usize = column(&batches, "score")
+        .iter()
+        .map(|a| a.null_count())
+        .sum();
     assert_eq!(nulls, 6, "no stored row has a value for the new column");
     assert_eq!(ints(&batches, "id"), vec![1, 2, 3, 4, 5, 6]);
 }
@@ -136,7 +139,10 @@ async fn rows_written_after_an_added_column_carry_it() {
     table.flush().await.unwrap();
 
     let batches = rows(&table).await;
-    let nulls: usize = column(&batches, "score").iter().map(|a| a.null_count()).sum();
+    let nulls: usize = column(&batches, "score")
+        .iter()
+        .map(|a| a.null_count())
+        .sum();
     assert_eq!(nulls, 6, "only the older rows are null");
     assert_eq!(ints(&batches, "id"), vec![1, 2, 3, 4, 5, 6, 7]);
 }
@@ -161,7 +167,10 @@ async fn a_duplicate_column_name_is_refused() {
         .add_column(Arc::new(Field::new("name", DataType::Utf8, true)))
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("already has a column"), "got {err}");
+    assert!(
+        err.to_string().contains("already has a column"),
+        "got {err}"
+    );
 }
 
 // ---- rename -------------------------------------------------------------
@@ -193,7 +202,10 @@ async fn renaming_a_column_that_is_not_there_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let table = table(&dir).await;
     let err = table.rename_column("absent", "x").await.unwrap_err();
-    assert!(err.to_string().contains("no column named absent"), "got {err}");
+    assert!(
+        err.to_string().contains("no column named absent"),
+        "got {err}"
+    );
 }
 
 // ---- drop ---------------------------------------------------------------
@@ -234,7 +246,9 @@ async fn dropping_the_first_column_leaves_the_others_where_they_belong() {
         .iter()
         .flat_map(|a| {
             let values = a.as_any().downcast_ref::<StringArray>().unwrap();
-            (0..values.len()).map(|r| values.value(r).to_string()).collect::<Vec<_>>()
+            (0..values.len())
+                .map(|r| values.value(r).to_string())
+                .collect::<Vec<_>>()
         })
         .collect();
     let mut sorted = names.clone();
@@ -313,7 +327,10 @@ async fn a_cast_the_types_do_not_allow_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let table = table(&dir).await;
     let err = table
-        .cast_column("name", DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None))
+        .cast_column(
+            "name",
+            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+        )
         .await;
     // Either arrow declines the pair outright or the values fail to convert;
     // both must leave the table as it was.
@@ -321,7 +338,14 @@ async fn a_cast_the_types_do_not_allow_is_refused() {
         return;
     }
     assert_eq!(table.schema().field(1).data_type(), &DataType::Utf8);
-    assert_eq!(rows(&table).await.iter().map(|b| b.num_rows()).sum::<usize>(), 6);
+    assert_eq!(
+        rows(&table)
+            .await
+            .iter()
+            .map(|b| b.num_rows())
+            .sum::<usize>(),
+        6
+    );
 }
 
 #[tokio::test]

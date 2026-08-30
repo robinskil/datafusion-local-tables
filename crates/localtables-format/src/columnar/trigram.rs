@@ -94,8 +94,8 @@ fn index_of(trigram: &[u8]) -> usize {
 /// Build a trigram filter over an array's non-null values.
 ///
 /// The filter is sized by the number of *distinct* trigrams, not the number
-/// produced. A column of prose repeats its trigrams heavily. To insert the same
-/// piece twice tells the filter nothing new, so a filter sized for every repeat
+/// produced. A column of prose repeats its trigrams heavily. The same piece
+/// inserted twice tells the filter nothing new. A filter sized for every repeat
 /// would be many times larger for no gain.
 ///
 /// That keeps the cost near zero on ordinary text and moderate on identifiers.
@@ -194,7 +194,9 @@ mod tests {
     }
 
     fn filter_over(values: &[&str]) -> BloomFilter {
-        build(&strings(values), BITS, ROOM).unwrap().expect("a filter")
+        build(&strings(values), BITS, ROOM)
+            .unwrap()
+            .expect("a filter")
     }
 
     fn holds(filter: &BloomFilter, pattern: &str) -> bool {
@@ -314,7 +316,9 @@ mod tests {
 
     #[test]
     fn a_column_of_short_values_gets_no_filter() {
-        assert!(build(&strings(&["a", "bc", ""]), BITS, ROOM).unwrap().is_none());
+        assert!(build(&strings(&["a", "bc", ""]), BITS, ROOM)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -345,7 +349,9 @@ mod tests {
         let refs: Vec<&str> = values.iter().map(String::as_str).collect();
         let full = build(&strings(&refs), BITS, ROOM).unwrap().unwrap();
 
-        assert!(build(&strings(&refs), BITS, full.byte_len()).unwrap().is_some());
+        assert!(build(&strings(&refs), BITS, full.byte_len())
+            .unwrap()
+            .is_some());
         assert!(
             build(&strings(&refs), BITS, full.byte_len() - 1)
                 .unwrap()
@@ -356,7 +362,9 @@ mod tests {
 
     #[test]
     fn repeating_a_value_does_not_grow_the_filter() {
-        let once = build(&strings(&["hello world"]), BITS, ROOM).unwrap().unwrap();
+        let once = build(&strings(&["hello world"]), BITS, ROOM)
+            .unwrap()
+            .unwrap();
         let many: Vec<&str> = std::iter::repeat_n("hello world", 1_000).collect();
         let repeated = build(&strings(&many), BITS, ROOM).unwrap().unwrap();
         assert_eq!(once.byte_len(), repeated.byte_len());

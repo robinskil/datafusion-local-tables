@@ -342,7 +342,7 @@ mod tests {
     /// without this a string column would often have no filter at all.
     #[test]
     fn a_view_column_gets_a_filter_that_matches_its_plain_form() {
-        use arrow_array::{StringViewArray, BinaryViewArray};
+        use arrow_array::{BinaryViewArray, StringViewArray};
 
         let values = ["alpha", "bravo", "charlie"];
         let plain = StringArray::from(values.to_vec());

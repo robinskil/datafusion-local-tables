@@ -46,9 +46,13 @@ fn options(page_rows: usize) -> TableOptions {
 }
 
 async fn table(dir: &tempfile::TempDir, name: &str, page_rows: usize) -> ColumnarTable {
-    let table = ColumnarTable::create(&dir.path().join(format!("{name}.lt")), schema(), options(page_rows))
-        .await
-        .unwrap();
+    let table = ColumnarTable::create(
+        &dir.path().join(format!("{name}.lt")),
+        schema(),
+        options(page_rows),
+    )
+    .await
+    .unwrap();
     let ids: Vec<i64> = (0..ROWS).collect();
     let bodies: Vec<String> = ids.iter().map(|i| format!("row {i}")).collect();
     table
@@ -77,7 +81,13 @@ fn session(table: &ColumnarTable) -> SessionContext {
 /// the scan's own metrics rather than the answer, which is the same either way.
 async fn rows_scanned(table: &ColumnarTable, sql: &str) -> usize {
     let ctx = session(table);
-    let plan = ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap();
+    let plan = ctx
+        .sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
     let task = ctx.task_ctx();
     let stream = datafusion::physical_plan::execute_stream(plan.clone(), task).unwrap();
     use futures::TryStreamExt;
@@ -180,10 +190,7 @@ async fn a_predicate_the_bounds_cannot_answer_reads_everything() {
 async fn a_scan_with_no_filter_reads_every_page() {
     let dir = tempfile::tempdir().unwrap();
     let paged = table(&dir, "paged", PAGE).await;
-    assert_eq!(
-        rows_scanned(&paged, "SELECT * FROM t").await,
-        ROWS as usize
-    );
+    assert_eq!(rows_scanned(&paged, "SELECT * FROM t").await, ROWS as usize);
 }
 
 /// Deleted rows are removed inside a page, so page boundaries keep meaning what
@@ -202,7 +209,10 @@ async fn deletes_and_page_bounds_agree() {
         .await
         .unwrap();
 
-    assert_eq!(answer(&paged, "SELECT * FROM t").await, (ROWS - 2000) as usize);
+    assert_eq!(
+        answer(&paged, "SELECT * FROM t").await,
+        (ROWS - 2000) as usize
+    );
     assert_eq!(answer(&paged, "SELECT * FROM t WHERE id = 5000").await, 1);
     assert_eq!(answer(&paged, "SELECT * FROM t WHERE id = 1500").await, 0);
     assert_eq!(

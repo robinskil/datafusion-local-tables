@@ -79,7 +79,9 @@ async fn table(dir: &tempfile::TempDir, name: &str, cluster: bool) -> SessionCon
 }
 
 fn pruned(plan: &str) -> usize {
-    let at = plan.find("pruned=").expect("the scan reports what it pruned");
+    let at = plan
+        .find("pruned=")
+        .expect("the scan reports what it pruned");
     plan[at + "pruned=".len()..]
         .chars()
         .take_while(char::is_ascii_digit)
@@ -131,7 +133,10 @@ async fn clustering_trades_one_perfect_column_for_two_good_ones() {
 
     // Eight segments. Written as it arrives: x 0, y 7.
     // Clustered: x 6, y 4.
-    assert_eq!(plain_x, 0, "every segment holds every x when written in order");
+    assert_eq!(
+        plain_x, 0,
+        "every segment holds every x when written in order"
+    );
     assert!(plain_y > 0, "y is the column the insert order follows");
 
     assert!(
@@ -202,7 +207,10 @@ async fn a_query_on_both_columns_prunes_hardest() {
         both >= one,
         "two bounds should not prune less than one: {both} against {one}"
     );
-    assert_eq!(rows(&ctx, "SELECT * FROM t WHERE x = 64 AND y = 64").await, 1);
+    assert_eq!(
+        rows(&ctx, "SELECT * FROM t WHERE x = 64 AND y = 64").await,
+        1
+    );
 }
 
 #[tokio::test]

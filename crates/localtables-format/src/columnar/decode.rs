@@ -138,7 +138,11 @@ pub fn decode_column_rows(
         // shares the same buffers.
         Encoding::Plain => {
             let array = make_array(rebuild(chunk, data_type, source)?);
-            Ok(if whole { array } else { array.slice(start, len) })
+            Ok(if whole {
+                array
+            } else {
+                array.slice(start, len)
+            })
         }
 
         // Stored as a dictionary over the column's type, then cast back. The
@@ -152,7 +156,11 @@ pub fn decode_column_rows(
             let stored =
                 DataType::Dictionary(Box::new(DataType::Int32), Box::new(data_type.clone()));
             let array = make_array(rebuild(chunk, &stored, source)?);
-            let array = if whole { array } else { array.slice(start, len) };
+            let array = if whole {
+                array
+            } else {
+                array.slice(start, len)
+            };
             arrow_cast::cast(&array, data_type)
                 .map_err(|e| Error::corrupt(format!("a dictionary chunk failed to expand: {e}")))
         }
@@ -161,7 +169,11 @@ pub fn decode_column_rows(
             let (run_ends, values) = run_end_fields(data_type);
             let stored = DataType::RunEndEncoded(run_ends, values);
             let array = make_array(rebuild(chunk, &stored, source)?);
-            let array = if whole { array } else { array.slice(start, len) };
+            let array = if whole {
+                array
+            } else {
+                array.slice(start, len)
+            };
             arrow_cast::cast(&array, data_type)
                 .map_err(|e| Error::corrupt(format!("a run-length chunk failed to expand: {e}")))
         }

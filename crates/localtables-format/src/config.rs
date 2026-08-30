@@ -226,9 +226,8 @@ pub struct TableOptions {
     /// row inside it.
     ///
     /// A compressed column is always cut. A variable-width column is cut even
-    /// when it is not compressed, because Arrow checks every offset of such a
-    /// column whatever range a reader asks for. A fixed-width column is never
-    /// cut.
+    /// when it is not compressed: Arrow checks every offset of such a column,
+    /// whatever range a reader asks for. A fixed-width column is never cut.
     ///
     /// Small blocks cost compression ratio. How much depends on the codec. lz4
     /// looks back 64 KiB whatever it gets, so 8,192-row blocks cost it about

@@ -1,20 +1,21 @@
 //! Row order that makes zone maps selective on several columns at once.
 //!
-//! A zone map prunes a column well when the rows are written in that column's
-//! order, because then a segment covers a narrow range of it. Only one column
-//! can have that at a time. Sort by `ts` and a segment covers a minute of time
-//! and the whole range of every other column.
+//! A zone map prunes a column well when the rows follow that column's order. A
+//! segment then covers a narrow range of it. Only one column can have that.
+//! Sort by `ts`, and a segment covers a minute of time and the whole range of
+//! every other column.
 //!
-//! A z-order interleaves the bits of several columns into one sort key, so a
-//! segment covers a compact box in all of them rather than a narrow slice of
-//! one. No column prunes as well as a single sort key would, and every one of
-//! them prunes far better than nothing.
+//! A z-order interleaves the bits of several columns into one sort key. A
+//! segment then covers a compact box in all of them, not a narrow slice of one.
+//! No column prunes as well as a single sort key gives it. Every column prunes
+//! far better than nothing.
 //!
 //! This is a layout, not an index. It writes the same rows in a different
-//! order and stores no extra bytes. Zone maps are still built from the values
-//! actually written, so nothing here can make pruning unsound: a poor key
-//! costs reads and never rows. That is why the key below is free to
-//! approximate.
+//! order and stores no extra bytes.
+//!
+//! Zone maps still come from the values written, so nothing here can make
+//! pruning unsound. A poor key costs reads, never rows. That is why the key
+//! below is free to approximate.
 
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
@@ -35,7 +36,11 @@ const DIM_BITS: usize = DIM_BYTES * 8;
 /// Zero for a null, so nulls cluster at one end. A value whose encoding is all
 /// zeros lands with them, which costs nothing: this decides an order, not an
 /// answer.
-fn dimension_bytes(array: &dyn Array, row: usize, scratch: &mut Vec<u8>) -> Result<[u8; DIM_BYTES]> {
+fn dimension_bytes(
+    array: &dyn Array,
+    row: usize,
+    scratch: &mut Vec<u8>,
+) -> Result<[u8; DIM_BYTES]> {
     let mut out = [0u8; DIM_BYTES];
     if array.is_null(row) {
         return Ok(out);
@@ -75,14 +80,16 @@ fn interleave_into(dimensions: &[[u8; DIM_BYTES]], key: &mut [u8]) {
 
 /// Check that a table can cluster by these columns, before it accepts writes.
 ///
-/// Done when the table opens rather than when it flushes, so a name that is
-/// wrong is an error the caller sees at once instead of a flush that fails
-/// later with rows already accepted.
+/// The table runs this check when it opens, not when it flushes. A wrong name
+/// is then an error the caller sees at once. A later flush would fail with rows
+/// already accepted.
 pub fn resolve(schema: &SchemaRef, names: &[String]) -> Result<Vec<usize>> {
     let mut indices = Vec::with_capacity(names.len());
     for name in names {
         let index = schema.index_of(name).map_err(|_| {
-            Error::InvalidArgument(format!("cannot cluster by {name}: the table has no such column"))
+            Error::InvalidArgument(format!(
+                "cannot cluster by {name}: the table has no such column"
+            ))
         })?;
         let data_type = schema.field(index).data_type();
         if !valuecodec::is_encodable(data_type) {
@@ -102,9 +109,8 @@ pub fn resolve(schema: &SchemaRef, names: &[String]) -> Result<Vec<usize>> {
 
 /// Order rows by their z-order key and cut them into row groups.
 ///
-/// Returns groups directly rather than reordered batches, because the reorder
-/// has to copy anyway and copying straight into the groups costs one pass
-/// instead of two.
+/// This returns groups, not reordered batches. The reorder must copy either
+/// way. To copy straight into the groups costs one pass instead of two.
 pub fn cluster(
     batches: &[RecordBatch],
     schema: &SchemaRef,
@@ -239,14 +245,13 @@ mod tests {
             .filter(|group| {
                 let values = group[0].column(column);
                 let values = values.as_any().downcast_ref::<Int64Array>().unwrap();
-                (0..values.len()).any(|row| values.value(row) == value)
-                    || {
-                        let (low, high) = (0..values.len())
-                            .fold((i64::MAX, i64::MIN), |(lo, hi), row| {
-                                (lo.min(values.value(row)), hi.max(values.value(row)))
-                            });
-                        (low..=high).contains(&value)
-                    }
+                (0..values.len()).any(|row| values.value(row) == value) || {
+                    let (low, high) = (0..values.len())
+                        .fold((i64::MAX, i64::MIN), |(lo, hi), row| {
+                            (lo.min(values.value(row)), hi.max(values.value(row)))
+                        });
+                    (low..=high).contains(&value)
+                }
             })
             .count()
     }
@@ -293,8 +298,16 @@ mod tests {
             .iter()
             .flatten()
             .flat_map(|batch| {
-                let xs = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-                let ys = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                let xs = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let ys = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
                 (0..batch.num_rows())
                     .map(|row| (xs.value(row), ys.value(row)))
                     .collect::<Vec<_>>()
@@ -302,7 +315,8 @@ mod tests {
             .collect();
         seen.sort_unstable();
 
-        let mut expected: Vec<(i64, i64)> = (0..16).flat_map(|y| (0..16).map(move |x| (x, y))).collect();
+        let mut expected: Vec<(i64, i64)> =
+            (0..16).flat_map(|y| (0..16).map(move |x| (x, y))).collect();
         expected.sort_unstable();
         assert_eq!(seen, expected);
     }
@@ -311,8 +325,16 @@ mod tests {
     fn a_row_keeps_its_other_columns() {
         let groups = cluster(&[grid()], &schema(), &columns(), 32).unwrap();
         for batch in groups.iter().flatten() {
-            let xs = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-            let labels = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+            let xs = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let labels = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
             for row in 0..batch.num_rows() {
                 assert_eq!(labels.value(row), format!("row-{}", xs.value(row)));
             }
@@ -389,7 +411,13 @@ mod tests {
     #[test]
     fn one_column_still_works_and_simply_sorts() {
         let columns = resolve(&schema(), &["x".to_string()]).unwrap();
-        let groups = cluster(&[batch(vec![3, 1, 2], vec![0, 0, 0])], &schema(), &columns, 3).unwrap();
+        let groups = cluster(
+            &[batch(vec![3, 1, 2], vec![0, 0, 0])],
+            &schema(),
+            &columns,
+            3,
+        )
+        .unwrap();
         let xs = groups[0][0].column(0);
         let xs = xs.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(xs.values(), &[1, 2, 3]);

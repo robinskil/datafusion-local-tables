@@ -6,7 +6,6 @@
 use super::*;
 
 impl ColumnarTable {
-
     /// Append rows.
     ///
     /// The rows are durable when this returns, and the next scan sees them.
@@ -63,7 +62,6 @@ impl ColumnarTable {
         Ok(rows)
     }
 
-
     /// Mark rows deleted by their position inside a segment.
     ///
     /// Returns how many rows this call newly deleted. Positions already
@@ -72,12 +70,10 @@ impl ColumnarTable {
         self.delete(deletions, &[]).await
     }
 
-
     /// Mark memtable rows deleted, by the sequence numbers they were given.
     pub async fn delete_memtable_rows(&self, seqnos: &[u64]) -> Result<u64> {
         self.delete(&[], seqnos).await
     }
-
 
     /// Delete rows in segments and in the memtable, as one durable record.
     pub async fn delete(
@@ -106,7 +102,6 @@ impl ColumnarTable {
         self.publish(&writer)?;
         Ok(deleted)
     }
-
 
     /// Replace rows: delete the ones named, and append their replacements.
     ///
@@ -157,9 +152,7 @@ impl ColumnarTable {
             base_seqno,
             batch: match &merged {
                 Some(batch) => crate::layout::batchcodec::encode(batch),
-                None => crate::layout::batchcodec::encode(&RecordBatch::new_empty(
-                    self.schema(),
-                )),
+                None => crate::layout::batchcodec::encode(&RecordBatch::new_empty(self.schema())),
             },
         };
         writer.wal.append_group(&[encode_record(&record)?])?;
@@ -179,7 +172,6 @@ impl ColumnarTable {
         }
         Ok(deleted.max(replacement_rows))
     }
-
 
     /// Delete every row of the named segments.
     ///
@@ -219,7 +211,6 @@ impl ColumnarTable {
         Ok(deleted)
     }
 
-
     /// Write the memtable out as a segment and empty the log.
     ///
     /// After this returns the table file alone holds everything: copying it is
@@ -228,7 +219,6 @@ impl ColumnarTable {
         let mut writer = self.inner.writer.lock().await;
         self.flush_locked(&mut writer).await
     }
-
 
     pub(super) async fn flush_locked(&self, writer: &mut Writer) -> Result<u64> {
         let frozen = writer.memtable.freeze()?;
@@ -301,7 +291,6 @@ impl ColumnarTable {
         Ok(frozen.rows)
     }
 
-
     /// Build one segment from these batches and record it in the manifest.
     /// Cut batches into the row groups a flush or a compaction will write.
     ///
@@ -325,7 +314,6 @@ impl ColumnarTable {
             group_rows,
         )
     }
-
 
     pub(super) async fn write_segment(
         &self,
@@ -365,13 +353,11 @@ impl ColumnarTable {
         Ok(built.row_count)
     }
 
-
     /// True when the memtable or the log has grown past its limit.
     pub(super) fn should_flush(&self, writer: &Writer) -> bool {
         writer.memtable.bytes() >= self.inner.options.memtable_max_bytes
             || writer.wal.active_len() >= self.inner.options.wal_max_bytes
     }
-
 
     /// Publish a manifest and the snapshot readers will see next.
     pub(super) async fn commit(&self, writer: &mut Writer, manifest: Manifest) -> Result<()> {
@@ -379,7 +365,6 @@ impl ColumnarTable {
         writer.file.commit(manifest, min_active).await?;
         self.publish(writer)
     }
-
 
     /// Swap in a snapshot of the writer's current state.
     pub(super) fn publish(&self, writer: &Writer) -> Result<()> {
@@ -450,7 +435,10 @@ pub(super) fn decode_batch(
 }
 
 /// Put logged segment deletions back into the writer's in-memory state.
-pub(super) fn apply_logged_deletes(writer: &mut Writer, segments: Vec<SegmentDeletes>) -> Result<()> {
+pub(super) fn apply_logged_deletes(
+    writer: &mut Writer,
+    segments: Vec<SegmentDeletes>,
+) -> Result<()> {
     for logged in segments {
         // A segment dropped since the delete was logged has nothing to mark.
         if writer.file.manifest().segment(logged.segment_id).is_none() {
@@ -554,7 +542,10 @@ pub(super) fn apply_deletes(writer: &mut Writer, planned: PlannedDeletes) -> u64
 /// alone.
 ///
 /// A limit of zero means one group, however large.
-pub(super) fn split_row_groups(batches: Vec<RecordBatch>, max_rows: usize) -> Vec<Vec<RecordBatch>> {
+pub(super) fn split_row_groups(
+    batches: Vec<RecordBatch>,
+    max_rows: usize,
+) -> Vec<Vec<RecordBatch>> {
     if max_rows == 0 {
         return if batches.is_empty() {
             Vec::new()

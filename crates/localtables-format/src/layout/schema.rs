@@ -83,9 +83,7 @@ impl SchemaLayout {
                 let anonymous: Vec<FieldRef> = fields[..count]
                     .iter()
                     .enumerate()
-                    .map(|(at, field)| {
-                        Arc::new(field.as_ref().clone().with_name(at.to_string()))
-                    })
+                    .map(|(at, field)| Arc::new(field.as_ref().clone().with_name(at.to_string())))
                     .collect();
                 fingerprint(&Schema::new(anonymous))
             })

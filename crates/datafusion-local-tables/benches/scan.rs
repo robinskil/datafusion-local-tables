@@ -641,7 +641,10 @@ fn scattered_point_lookup(c: &mut Criterion) {
     );
     ctx.register_table(
         "no_filter",
-        Arc::new(ColumnarTableProvider::new(build("no_filter", BloomFilters::None))),
+        Arc::new(ColumnarTableProvider::new(build(
+            "no_filter",
+            BloomFilters::None,
+        ))),
     )
     .unwrap();
     ctx.register_table(
@@ -670,12 +673,6 @@ fn scattered_point_lookup(c: &mut Criterion) {
     }
     group.finish();
 }
-
-
-
-
-
-
 
 /// What compression and blocking cost to *write*.
 ///
@@ -726,29 +723,65 @@ fn write_cost(c: &mut Criterion) {
         ..TableOptions::default()
     };
     let settings: Vec<(&str, TableOptions)> = vec![
-        ("raw, unblocked", TableOptions { compression_block_rows: 0, ..base.clone() }),
+        (
+            "raw, unblocked",
+            TableOptions {
+                compression_block_rows: 0,
+                ..base.clone()
+            },
+        ),
         ("raw, blocked", base.clone()),
-        ("lz4, blocked", TableOptions { compression: Compression::Lz4, ..base.clone() }),
+        (
+            "lz4, blocked",
+            TableOptions {
+                compression: Compression::Lz4,
+                ..base.clone()
+            },
+        ),
         (
             "lz4, unblocked",
-            TableOptions { compression: Compression::Lz4, compression_block_rows: 0, ..base.clone() },
+            TableOptions {
+                compression: Compression::Lz4,
+                compression_block_rows: 0,
+                ..base.clone()
+            },
         ),
-        ("zstd, blocked", TableOptions { compression: Compression::Zstd, ..base.clone() }),
+        (
+            "zstd, blocked",
+            TableOptions {
+                compression: Compression::Zstd,
+                ..base.clone()
+            },
+        ),
         (
             "zstd, unblocked",
-            TableOptions { compression: Compression::Zstd, compression_block_rows: 0, ..base.clone() },
+            TableOptions {
+                compression: Compression::Zstd,
+                compression_block_rows: 0,
+                ..base.clone()
+            },
         ),
         (
             "zstd, 512-row blocks",
-            TableOptions { compression: Compression::Zstd, compression_block_rows: 512, ..base.clone() },
+            TableOptions {
+                compression: Compression::Zstd,
+                compression_block_rows: 512,
+                ..base.clone()
+            },
         ),
         (
             "+ membership filter",
-            TableOptions { bloom_filters: BloomFilters::All, ..base.clone() },
+            TableOptions {
+                bloom_filters: BloomFilters::All,
+                ..base.clone()
+            },
         ),
         (
             "+ trigram filter",
-            TableOptions { trigram_filters: BloomFilters::All, ..base.clone() },
+            TableOptions {
+                trigram_filters: BloomFilters::All,
+                ..base.clone()
+            },
         ),
         (
             "+ both filters",
@@ -770,10 +803,18 @@ fn write_cost(c: &mut Criterion) {
         for (name, options) in &settings {
             // Report what a flush would hand the disk, so the processor cost
             // and the bytes it saves can be read together.
-            let built =
-                build_segment(0, schema, layout.current(), std::slice::from_ref(batch), options)
-                    .unwrap();
-            println!("write {label:>8} {name:<22} {:>6} KiB", built.bytes.len() / 1024);
+            let built = build_segment(
+                0,
+                schema,
+                layout.current(),
+                std::slice::from_ref(batch),
+                options,
+            )
+            .unwrap();
+            println!(
+                "write {label:>8} {name:<22} {:>6} KiB",
+                built.bytes.len() / 1024
+            );
 
             group.bench_function(*name, |b| {
                 b.iter(|| {
@@ -861,7 +902,12 @@ fn page_size_tradeoff(c: &mut Criterion) {
         ("zstd_8192".to_string(), Compression::Zstd, 8192, false),
         ("zstd_2048".to_string(), Compression::Zstd, 2048, false),
         ("zstd_512".to_string(), Compression::Zstd, 512, false),
-        ("zstd_8192_sorted".to_string(), Compression::Zstd, 8192, true),
+        (
+            "zstd_8192_sorted".to_string(),
+            Compression::Zstd,
+            8192,
+            true,
+        ),
     ];
     for (name, compression, block_rows, sorted) in &cases {
         ctx.register_table(
@@ -945,7 +991,11 @@ fn compression_choice(c: &mut Criterion) {
     ] {
         ctx.register_table(
             name,
-            Arc::new(ColumnarTableProvider::new(build(name, compression, block_rows))),
+            Arc::new(ColumnarTableProvider::new(build(
+                name,
+                compression,
+                block_rows,
+            ))),
         )
         .unwrap();
         let size: u64 = std::fs::metadata(dir.path().join(format!("{name}.lt")))
@@ -956,7 +1006,10 @@ fn compression_choice(c: &mut Criterion) {
 
     for (label, sql) in [
         ("full scan", "SELECT sum(payload) FROM {}"),
-        ("string group by", "SELECT category, count(*) FROM {} GROUP BY category"),
+        (
+            "string group by",
+            "SELECT category, count(*) FROM {} GROUP BY category",
+        ),
         ("point lookup", "SELECT * FROM {} WHERE id = 372145"),
     ] {
         let mut group = c.benchmark_group(format!("compression: {label}"));
@@ -1020,7 +1073,9 @@ fn page_pruning(c: &mut Criterion) {
     ] {
         ctx.register_table(
             name,
-            Arc::new(ColumnarTableProvider::new(build(name, page_rows, re_encode))),
+            Arc::new(ColumnarTableProvider::new(build(
+                name, page_rows, re_encode,
+            ))),
         )
         .unwrap();
     }
@@ -1183,7 +1238,11 @@ fn substring_search(c: &mut Criterion) {
         )
         .unwrap()
     };
-    let all_batches = || (0..ROWS / ROWS_PER_SEGMENT).map(make_batch).collect::<Vec<_>>();
+    let all_batches = || {
+        (0..ROWS / ROWS_PER_SEGMENT)
+            .map(make_batch)
+            .collect::<Vec<_>>()
+    };
 
     let build = |name: &'static str, filters: BloomFilters| {
         let schema = schema.clone();
@@ -1213,7 +1272,10 @@ fn substring_search(c: &mut Criterion) {
     let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
     ctx.register_table(
         "no_filter",
-        Arc::new(ColumnarTableProvider::new(build("no_filter", BloomFilters::None))),
+        Arc::new(ColumnarTableProvider::new(build(
+            "no_filter",
+            BloomFilters::None,
+        ))),
     )
     .unwrap();
     ctx.register_table(

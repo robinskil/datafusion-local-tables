@@ -75,13 +75,19 @@ async fn one_int(ctx: &SessionContext, sql: &str) -> i64 {
     let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
     let column = batches[0].column(0);
     match column.data_type() {
-        DataType::Int64 => column.as_any().downcast_ref::<Int64Array>().unwrap().value(0),
+        DataType::Int64 => column
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
         other => panic!("unexpected {other}"),
     }
 }
 
 fn pruned(plan: &str) -> usize {
-    let at = plan.find("pruned=").expect("the scan reports what it pruned");
+    let at = plan
+        .find("pruned=")
+        .expect("the scan reports what it pruned");
     plan[at + "pruned=".len()..]
         .chars()
         .take_while(char::is_ascii_digit)
@@ -214,5 +220,8 @@ async fn a_table_reopened_after_a_change_reads_the_new_schema() {
 
     assert_eq!(one_int(&ctx, "SELECT count(*) FROM t").await, 500);
     assert_eq!(rows(&ctx, "SELECT id, name, score FROM t").await, 500);
-    assert_eq!(one_int(&ctx, "SELECT sum(id) FROM t").await, (0..500i64).sum::<i64>());
+    assert_eq!(
+        one_int(&ctx, "SELECT sum(id) FROM t").await,
+        (0..500i64).sum::<i64>()
+    );
 }

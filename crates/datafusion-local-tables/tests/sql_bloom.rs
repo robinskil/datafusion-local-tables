@@ -56,7 +56,10 @@ async fn table(dir: &tempfile::TempDir, filters: BloomFilters) -> (ColumnarTable
 
     for segment in 0..SEGMENTS {
         let keys = keys_of(segment);
-        let emails: Vec<String> = keys.iter().map(|k| format!("user{k}@example.com")).collect();
+        let emails: Vec<String> = keys
+            .iter()
+            .map(|k| format!("user{k}@example.com"))
+            .collect();
         let batch = RecordBatch::try_new(
             schema(),
             vec![
@@ -95,7 +98,9 @@ async fn plan_of(ctx: &SessionContext, sql: &str) -> String {
 /// to be ruled out. That costs a read and never a row, and which values it
 /// happens to affect is a property of the hash, not of the data.
 fn pruned(plan: &str) -> usize {
-    let at = plan.find("pruned=").expect("the scan reports what it pruned");
+    let at = plan
+        .find("pruned=")
+        .expect("the scan reports what it pruned");
     plan[at + "pruned=".len()..]
         .chars()
         .take_while(char::is_ascii_digit)
@@ -198,10 +203,7 @@ async fn a_set_of_values_prunes_to_the_segments_that_hold_them() {
     // Keys 3 and 7 sit in segments 3 and 7, so eight segments hold neither.
     let sql = "SELECT key FROM t WHERE key IN (3, 7)";
     let plan = plan_of(&ctx, sql).await;
-    assert!(
-        pruned(&plan) >= 7,
-        "two segments hold these keys:\n{plan}"
-    );
+    assert!(pruned(&plan) >= 7, "two segments hold these keys:\n{plan}");
     assert_eq!(rows(&ctx, sql).await, 2);
 }
 
