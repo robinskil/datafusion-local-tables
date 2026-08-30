@@ -8,7 +8,8 @@
 
 use arrow_ipc::convert::{fb_to_schema, IpcSchemaEncoder};
 use arrow_ipc::writer::DictionaryTracker;
-use arrow_schema::Schema;
+use arrow_schema::{FieldRef, Schema};
+use std::sync::Arc;
 
 use crate::layout::checksum;
 use crate::{Error, Result};
@@ -53,6 +54,58 @@ pub fn decode(bytes: &[u8]) -> Result<Schema> {
 /// nullability, types and metadata all take part.
 pub fn fingerprint(schema: &Schema) -> u64 {
     checksum(&encode(schema))
+}
+
+/// What a segment's bytes must look like to be read as a given schema.
+///
+/// A segment holds the columns the schema had when it was written, which is
+/// always a prefix of what the schema has now: a column is only ever added at
+/// the end without a rewrite, and every change that would move a column
+/// rewrites every segment. So a segment with `n` columns is readable exactly
+/// when its fingerprint matches the schema's first `n`.
+///
+/// Names take no part. A segment stores buffers whose meaning comes from a
+/// column's type, not its name, so renaming a column must not invalidate data
+/// already written. Types, nullability, order and field metadata all do count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaLayout {
+    /// Fingerprint of the first `n` columns, indexed by `n`.
+    prefixes: Vec<u64>,
+}
+
+impl SchemaLayout {
+    pub fn of(schema: &Schema) -> Self {
+        let fields = schema.fields();
+        let prefixes = (0..=fields.len())
+            .map(|count| {
+                // Names replaced by position, so only the shape is hashed.
+                let anonymous: Vec<FieldRef> = fields[..count]
+                    .iter()
+                    .enumerate()
+                    .map(|(at, field)| {
+                        Arc::new(field.as_ref().clone().with_name(at.to_string()))
+                    })
+                    .collect();
+                fingerprint(&Schema::new(anonymous))
+            })
+            .collect();
+        Self { prefixes }
+    }
+
+    /// The fingerprint a segment written against the whole schema carries.
+    pub fn current(&self) -> u64 {
+        *self.prefixes.last().expect("a layout covers zero columns")
+    }
+
+    pub fn columns(&self) -> usize {
+        self.prefixes.len() - 1
+    }
+
+    /// Whether a segment holding `columns` columns and stamped `fingerprint`
+    /// can be read as this schema.
+    pub fn accepts(&self, columns: usize, fingerprint: u64) -> bool {
+        self.prefixes.get(columns) == Some(&fingerprint)
+    }
 }
 
 #[cfg(test)]
@@ -125,5 +178,110 @@ mod tests {
         }
         // Either a clean error or a schema that differs; never a panic.
         let _ = decode(&bytes);
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use arrow_schema::{DataType, Field};
+
+    fn schema(fields: Vec<Field>) -> Schema {
+        Schema::new(fields)
+    }
+
+    fn two() -> Schema {
+        schema(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ])
+    }
+
+    #[test]
+    fn a_segment_written_against_the_whole_schema_is_accepted() {
+        let layout = SchemaLayout::of(&two());
+        assert!(layout.accepts(2, layout.current()));
+        assert_eq!(layout.columns(), 2);
+    }
+
+    /// The case a new column creates: old segments hold a prefix.
+    #[test]
+    fn a_segment_holding_a_prefix_is_accepted() {
+        let before = SchemaLayout::of(&two());
+        let after = SchemaLayout::of(&schema(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("score", DataType::Float64, true),
+        ]));
+
+        assert!(
+            after.accepts(2, before.current()),
+            "a segment written before the column was added must still read"
+        );
+        assert!(after.accepts(3, after.current()));
+    }
+
+    /// The case a rename must not create.
+    #[test]
+    fn renaming_a_column_does_not_invalidate_a_segment() {
+        let before = SchemaLayout::of(&two());
+        let renamed = SchemaLayout::of(&schema(vec![
+            Field::new("identifier", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        assert_eq!(before.current(), renamed.current());
+    }
+
+    #[test]
+    fn changing_a_type_invalidates_a_segment() {
+        let before = SchemaLayout::of(&two());
+        let widened = SchemaLayout::of(&schema(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::LargeUtf8, true),
+        ]));
+        assert!(!widened.accepts(2, before.current()));
+    }
+
+    #[test]
+    fn changing_nullability_invalidates_a_segment() {
+        let before = SchemaLayout::of(&two());
+        let tightened = SchemaLayout::of(&schema(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        assert!(!tightened.accepts(2, before.current()));
+    }
+
+    #[test]
+    fn reordering_columns_invalidates_a_segment() {
+        let before = SchemaLayout::of(&two());
+        let swapped = SchemaLayout::of(&schema(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        assert!(!swapped.accepts(2, before.current()));
+    }
+
+    /// Dropping the last column leaves old segments holding one column too
+    /// many, which is refused: a drop rewrites.
+    #[test]
+    fn a_segment_with_more_columns_than_the_schema_is_refused() {
+        let before = SchemaLayout::of(&two());
+        let shorter = SchemaLayout::of(&schema(vec![Field::new("id", DataType::Int64, false)]));
+        assert!(!shorter.accepts(2, before.current()));
+    }
+
+    #[test]
+    fn a_prefix_fingerprint_does_not_match_the_wrong_length() {
+        let layout = SchemaLayout::of(&two());
+        assert!(!layout.accepts(1, layout.current()));
+        assert!(!layout.accepts(0, layout.current()));
+    }
+
+    #[test]
+    fn an_empty_schema_has_one_prefix() {
+        let layout = SchemaLayout::of(&Schema::empty());
+        assert_eq!(layout.columns(), 0);
+        assert!(layout.accepts(0, layout.current()));
     }
 }

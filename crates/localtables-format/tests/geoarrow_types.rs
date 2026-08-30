@@ -282,15 +282,15 @@ async fn round_trip(
     let path = dir.path().join("geo.lt");
     let io = open_backend(&path, opts.io_backend, opts.durability, false).unwrap();
 
-    let fingerprint = schema_codec::fingerprint(schema);
-    let built = build_segment(0, schema, fingerprint, std::slice::from_ref(batch), opts).unwrap();
+    let layout = schema_codec::SchemaLayout::of(schema);
+    let built = build_segment(0, schema, layout.current(), std::slice::from_ref(batch), opts).unwrap();
 
     io.set_len(SEGMENT_ALIGN).await.unwrap();
     let offset = io.append(&[&built.bytes]).await.unwrap();
     let (data, meta) = built.placed(offset);
 
     let bytes = io.read_immutable(data).await.unwrap();
-    let reader = SegmentReader::new(bytes, offset, meta, schema.clone(), fingerprint).unwrap();
+    let reader = SegmentReader::new(bytes, offset, meta, schema.clone(), &layout).unwrap();
     (dir, reader)
 }
 

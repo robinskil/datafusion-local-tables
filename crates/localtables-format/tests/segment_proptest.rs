@@ -128,16 +128,16 @@ fn round_trip(schema: &SchemaRef, batch: &RecordBatch, opts: &TableOptions) -> R
         let path = dir.path().join("segment.lt");
         let io = open_backend(&path, opts.io_backend, opts.durability, false).unwrap();
 
-        let fingerprint = schema_codec::fingerprint(schema);
+        let layout = schema_codec::SchemaLayout::of(schema);
         let built =
-            build_segment(0, schema, fingerprint, std::slice::from_ref(batch), opts).unwrap();
+            build_segment(0, schema, layout.current(), std::slice::from_ref(batch), opts).unwrap();
 
         io.set_len(SEGMENT_ALIGN).await.unwrap();
         let offset = io.append(&[&built.bytes]).await.unwrap();
         let (data, meta) = built.placed(offset);
 
         let bytes = io.read_immutable(data).await.unwrap();
-        let reader = SegmentReader::new(bytes, offset, meta, schema.clone(), fingerprint).unwrap();
+        let reader = SegmentReader::new(bytes, offset, meta, schema.clone(), &layout).unwrap();
         reader.read(None).unwrap()
     })
 }
@@ -203,13 +203,13 @@ proptest! {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("segment.lt");
             let io = open_backend(&path, opts.io_backend, opts.durability, false).unwrap();
-            let fingerprint = schema_codec::fingerprint(&schema);
-            let built = build_segment(0, &schema, fingerprint, std::slice::from_ref(&batch), &opts).unwrap();
+            let layout = schema_codec::SchemaLayout::of(&schema);
+            let built = build_segment(0, &schema, layout.current(), std::slice::from_ref(&batch), &opts).unwrap();
             io.set_len(SEGMENT_ALIGN).await.unwrap();
             let offset = io.append(&[&built.bytes]).await.unwrap();
             let (data, meta) = built.placed(offset);
             let bytes = io.read_immutable(data).await.unwrap();
-            let reader = SegmentReader::new(bytes, offset, meta, schema.clone(), fingerprint).unwrap();
+            let reader = SegmentReader::new(bytes, offset, meta, schema.clone(), &layout).unwrap();
 
             for index in 0..columns.len() {
                 let projected = reader.read(Some(&[index])).unwrap();
@@ -235,8 +235,8 @@ proptest! {
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
 
         let opts = options(Compression::None, false);
-        let fingerprint = schema_codec::fingerprint(&schema);
-        let built = build_segment(0, &schema, fingerprint, &[batch], &opts).unwrap();
+        let layout = schema_codec::SchemaLayout::of(&schema);
+        let built = build_segment(0, &schema, layout.current(), &[batch], &opts).unwrap();
         let zone = built.meta.columns[0].zone.clone();
 
         let present: Vec<i64> = values.iter().flatten().copied().collect();
@@ -268,8 +268,8 @@ proptest! {
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
 
         let opts = options(Compression::None, false);
-        let fingerprint = schema_codec::fingerprint(&schema);
-        let built = build_segment(0, &schema, fingerprint, &[batch], &opts).unwrap();
+        let layout = schema_codec::SchemaLayout::of(&schema);
+        let built = build_segment(0, &schema, layout.current(), &[batch], &opts).unwrap();
         let zone = built.meta.columns[0].zone.clone();
 
         if let Some(min) = zone.min_array(&DataType::Utf8) {

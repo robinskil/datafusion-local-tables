@@ -31,8 +31,8 @@ async fn round_trip(
     let path = dir.path().join("segment.lt");
     let io = open_backend(&path, options.io_backend, Durability::None, false).unwrap();
 
-    let fingerprint = schema_codec::fingerprint(schema);
-    let built = build_segment(0, schema, fingerprint, batches, options).unwrap();
+    let layout = schema_codec::SchemaLayout::of(schema);
+    let built = build_segment(0, schema, layout.current(), batches, options).unwrap();
 
     // Place the segment where a real table would: on a page boundary.
     io.set_len(SEGMENT_ALIGN).await.unwrap();
@@ -45,7 +45,7 @@ async fn round_trip(
 
     let (data, meta) = built.placed(offset);
     let bytes = io.read_immutable(data).await.unwrap();
-    let reader = SegmentReader::new(bytes, offset, meta, schema.clone(), fingerprint).unwrap();
+    let reader = SegmentReader::new(bytes, offset, meta, schema.clone(), &layout).unwrap();
     (dir, reader)
 }
 
@@ -223,15 +223,15 @@ async fn decoded_arrays_point_into_the_mapped_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("segment.lt");
     let io = open_backend(&path, IoBackend::Mmap, Durability::None, false).unwrap();
-    let fingerprint = schema_codec::fingerprint(&schema);
-    let built = build_segment(0, &schema, fingerprint, &[original], &opts).unwrap();
+    let layout = schema_codec::SchemaLayout::of(&schema);
+    let built = build_segment(0, &schema, layout.current(), &[original], &opts).unwrap();
     io.set_len(SEGMENT_ALIGN).await.unwrap();
     let offset = io.append(&[&built.bytes]).await.unwrap();
     let (data, meta) = built.placed(offset);
 
     let bytes = io.read_immutable(data).await.unwrap();
     let base = bytes.as_slice().as_ptr_range();
-    let reader = SegmentReader::new(bytes, offset, meta, schema, fingerprint).unwrap();
+    let reader = SegmentReader::new(bytes, offset, meta, schema, &layout).unwrap();
 
     let column = reader.column(0).unwrap();
     let value_ptr = column.to_data().buffers()[0].as_ptr();
@@ -481,8 +481,8 @@ async fn a_damaged_column_buffer_is_caught_not_decoded() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("segment.lt");
     let opts = options(Compression::None, false);
-    let fingerprint = schema_codec::fingerprint(&schema);
-    let built = build_segment(0, &schema, fingerprint, &[original], &opts).unwrap();
+    let layout = schema_codec::SchemaLayout::of(&schema);
+    let built = build_segment(0, &schema, layout.current(), &[original], &opts).unwrap();
 
     let io = open_backend(&path, IoBackend::Pread, Durability::None, false).unwrap();
     io.set_len(SEGMENT_ALIGN).await.unwrap();
@@ -500,7 +500,7 @@ async fn a_damaged_column_buffer_is_caught_not_decoded() {
     io.write_at(target, &[byte]).await.unwrap();
 
     let bytes = io.read_immutable(data).await.unwrap();
-    let reader = SegmentReader::new(bytes, offset, meta, schema, fingerprint).unwrap();
+    let reader = SegmentReader::new(bytes, offset, meta, schema, &layout).unwrap();
 
     let err = reader.column(0).unwrap_err();
     assert!(
@@ -523,7 +523,8 @@ async fn a_segment_written_for_another_schema_is_refused() {
     let (data, meta) = built.placed(offset);
 
     let bytes = io.read_immutable(data).await.unwrap();
-    let err = SegmentReader::new(bytes, offset, meta, schema, 0xbbbb).unwrap_err();
+    let layout = schema_codec::SchemaLayout::of(&schema);
+    let err = SegmentReader::new(bytes, offset, meta, schema, &layout).unwrap_err();
     assert!(
         matches!(err, localtables_format::Error::SchemaMismatch(_)),
         "got {err:?}"
@@ -538,8 +539,8 @@ async fn a_truncated_segment_is_refused_rather_than_read() {
     let path = dir.path().join("segment.lt");
     let io = open_backend(&path, IoBackend::Pread, Durability::None, false).unwrap();
 
-    let fingerprint = schema_codec::fingerprint(&schema);
-    let built = build_segment(0, &schema, fingerprint, &[original], &opts).unwrap();
+    let layout = schema_codec::SchemaLayout::of(&schema);
+    let built = build_segment(0, &schema, layout.current(), &[original], &opts).unwrap();
     io.set_len(SEGMENT_ALIGN).await.unwrap();
     let offset = io.append(&[&built.bytes]).await.unwrap();
     let (_data, meta) = built.placed(offset);
@@ -547,7 +548,7 @@ async fn a_truncated_segment_is_refused_rather_than_read() {
     // Hand the reader fewer bytes than the segment needs.
     let short = Extent::new(offset, built.len() / 2);
     let bytes = io.read_immutable(short).await.unwrap();
-    let err = SegmentReader::new(bytes, offset, meta, schema, fingerprint).unwrap_err();
+    let err = SegmentReader::new(bytes, offset, meta, schema, &layout).unwrap_err();
     assert!(
         matches!(err, localtables_format::Error::Corrupt(_)),
         "got {err:?}"
@@ -959,5 +960,122 @@ async fn a_sliced_view_column_does_not_store_its_parents_rows() {
     assert!(
         stored < 1_000,
         "two rows should not carry five thousand: stored {stored} bytes"
+    );
+}
+
+/// Reading a segment as a schema that has gained a column since it was
+/// written. This is what an added column looks like from below: the rows are
+/// older than the column, so they have no value for it.
+#[tokio::test]
+async fn a_segment_written_before_a_column_existed_reads_it_as_null() {
+    let before: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let after: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("score", DataType::Float64, true),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        before.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )
+    .unwrap();
+
+    let opts = options(Compression::None, false);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("segment.lt");
+    let io = open_backend(&path, IoBackend::Mmap, Durability::None, false).unwrap();
+
+    // Written when the schema had two columns.
+    let written = schema_codec::SchemaLayout::of(&before);
+    let built = build_segment(0, &before, written.current(), &[batch], &opts).unwrap();
+    io.set_len(SEGMENT_ALIGN).await.unwrap();
+    let offset = io.append(&[&built.bytes]).await.unwrap();
+    let (data, meta) = built.placed(offset);
+    let bytes = io.read_immutable(data).await.unwrap();
+
+    // Read now that the schema has three.
+    let layout = schema_codec::SchemaLayout::of(&after);
+    let reader = SegmentReader::new(bytes, offset, meta, after.clone(), &layout).unwrap();
+
+    let full = reader.read(None).unwrap();
+    assert_eq!(full.num_columns(), 3);
+    assert_eq!(full.num_rows(), 3);
+    assert_eq!(full.schema().field(2).name(), "score");
+    assert_eq!(
+        full.column(2).null_count(),
+        3,
+        "rows older than the column have no value for it"
+    );
+    // The columns that were written are untouched.
+    assert_eq!(
+        full.column(0).as_any().downcast_ref::<Int32Array>().unwrap(),
+        &Int32Array::from(vec![1, 2, 3])
+    );
+
+    // Projecting only the new column works, and so does mixing old and new.
+    let only_new = reader.read(Some(&[2])).unwrap();
+    assert_eq!(only_new.num_rows(), 3);
+    assert_eq!(only_new.column(0).null_count(), 3);
+
+    let mixed = reader.read(Some(&[2, 0])).unwrap();
+    assert_eq!(mixed.num_columns(), 2);
+    assert_eq!(mixed.column(0).null_count(), 3);
+    assert_eq!(
+        mixed.column(1).as_any().downcast_ref::<Int32Array>().unwrap(),
+        &Int32Array::from(vec![1, 2, 3])
+    );
+
+    // And one column at a time.
+    assert_eq!(reader.column(2).unwrap().null_count(), 3);
+    assert_eq!(reader.column(0).unwrap().len(), 3);
+}
+
+/// A segment holding columns the schema no longer has is refused rather than
+/// misread, which is why dropping a column rewrites.
+#[tokio::test]
+async fn a_segment_with_columns_the_schema_lost_is_refused() {
+    let before: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let after: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+
+    let batch = RecordBatch::try_new(
+        before.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["a"])),
+        ],
+    )
+    .unwrap();
+
+    let opts = options(Compression::None, false);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("segment.lt");
+    let io = open_backend(&path, IoBackend::Mmap, Durability::None, false).unwrap();
+
+    let written = schema_codec::SchemaLayout::of(&before);
+    let built = build_segment(0, &before, written.current(), &[batch], &opts).unwrap();
+    io.set_len(SEGMENT_ALIGN).await.unwrap();
+    let offset = io.append(&[&built.bytes]).await.unwrap();
+    let (data, meta) = built.placed(offset);
+    let bytes = io.read_immutable(data).await.unwrap();
+
+    let layout = schema_codec::SchemaLayout::of(&after);
+    let err = SegmentReader::new(bytes, offset, meta, after, &layout).unwrap_err();
+    assert!(
+        matches!(err, localtables_format::Error::SchemaMismatch(_)),
+        "got {err:?}"
     );
 }

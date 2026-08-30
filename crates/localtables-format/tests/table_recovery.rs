@@ -113,7 +113,7 @@ async fn an_insert_is_all_or_nothing() {
             let built = localtables_format::columnar::segment::build_segment(
                 segment_id,
                 &schema(),
-                localtables_format::layout::schema::fingerprint(&schema()),
+                localtables_format::layout::schema::SchemaLayout::of(&schema()).current(),
                 &[batch(&[4, 5, 6])],
                 &options(),
             )

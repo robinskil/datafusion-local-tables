@@ -24,6 +24,7 @@ use crate::columnar::delete_vector::DeleteVector;
 use crate::columnar::memtable::Memtable;
 use crate::columnar::segment::{build_segment, SegmentReader};
 use crate::columnar::zorder;
+use crate::layout::schema::SchemaLayout;
 use crate::config::TableOptions;
 use crate::io::FileIo;
 use crate::layout::manifest::{Manifest, SegmentEntry, SegmentId};
@@ -87,6 +88,10 @@ struct Inner {
     path: PathBuf,
     schema: SchemaRef,
     schema_fingerprint: u64,
+    /// What a segment's bytes must look like to be read as this schema, for
+    /// every prefix of it. A segment written before a column was added holds
+    /// one of those prefixes.
+    layout: SchemaLayout,
     options: TableOptions,
     /// Columns whose bits order the rows a flush writes, already resolved to
     /// positions and checked against the schema.
@@ -125,6 +130,7 @@ impl ColumnarTable {
     async fn from_file(file: TableFile) -> Result<Self> {
         let schema = file.schema().clone();
         let schema_fingerprint = schema_codec::fingerprint(&schema);
+        let layout = SchemaLayout::of(&schema);
         // Checked here rather than at flush, so a name that is wrong is an
         // error the caller sees before the table has accepted a single row.
         let cluster_columns = zorder::resolve(&schema, &file.options().cluster_by)?;
@@ -172,6 +178,7 @@ impl ColumnarTable {
                 path,
                 schema,
                 schema_fingerprint,
+                layout,
                 options,
                 cluster_columns,
             }),
@@ -538,7 +545,7 @@ impl ColumnarTable {
         let built = build_segment(
             segment_id,
             &self.inner.schema,
-            self.inner.schema_fingerprint,
+            self.inner.layout.current(),
             batches,
             &self.inner.options,
         )?;
@@ -589,7 +596,7 @@ impl ColumnarTable {
             entry.data.offset,
             entry.meta,
             self.inner.schema.clone(),
-            self.inner.schema_fingerprint,
+            &self.inner.layout,
         )
     }
 

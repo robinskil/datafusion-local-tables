@@ -30,6 +30,7 @@ use crate::columnar::page::{
 use crate::config::TableOptions;
 use crate::io::buf::SharedBuf;
 use crate::layout::frame::{self, tag};
+use crate::layout::schema::SchemaLayout;
 use crate::layout::{align_up, checksum, Extent, BUFFER_ALIGN};
 use crate::{Error, Result};
 
@@ -138,6 +139,11 @@ pub fn build_segment(
         meta,
         bytes,
     })
+}
+
+/// A column of nulls for rows written before the column existed.
+fn absent_column(field: &arrow_schema::Field, rows: usize) -> ArrayRef {
+    arrow_array::new_null_array(field.data_type(), rows)
 }
 
 /// Bring each column together across the batches.
@@ -265,7 +271,7 @@ impl SegmentReader {
         segment_start: u64,
         meta: Extent,
         schema: SchemaRef,
-        schema_fingerprint: u64,
+        layout: &SchemaLayout,
     ) -> Result<Self> {
         let meta_offset = meta.offset.checked_sub(segment_start).ok_or_else(|| {
             Error::corrupt(format!(
@@ -289,20 +295,18 @@ impl SegmentReader {
             schema,
         };
 
-        // Check now, so nothing downstream has to wonder whether it was checked.
+        // Check now, so nothing downstream has to wonder whether it was
+        // checked. A segment may hold fewer columns than the schema, which is
+        // what a column added since it was written looks like; it may not hold
+        // different ones, and the fingerprint is what tells those apart.
         let meta = reader.meta()?;
-        if meta.schema_fingerprint.to_native() != schema_fingerprint {
+        let columns = meta.columns.len();
+        if !layout.accepts(columns, meta.schema_fingerprint.to_native()) {
             return Err(Error::SchemaMismatch(format!(
-                "segment holds schema {:#018x}, the table uses {:#018x}",
+                "a {columns}-column segment stamped {:#018x} does not match the first \
+                 {columns} of this {}-column schema",
                 meta.schema_fingerprint.to_native(),
-                schema_fingerprint
-            )));
-        }
-        if meta.columns.len() != reader.schema.fields().len() {
-            return Err(Error::corrupt(format!(
-                "segment holds {} columns, the schema has {}",
-                meta.columns.len(),
-                reader.schema.fields().len()
+                layout.columns()
             )));
         }
         Ok(reader)
@@ -377,16 +381,23 @@ impl SegmentReader {
     }
 
     /// Decode one column by its position in the table schema.
+    ///
+    /// A column the segment predates reads as nulls. That is what a column
+    /// added without a rewrite means: the rows are older than the column, so
+    /// they have no value for it.
     pub fn column(&self, index: usize) -> Result<ArrayRef> {
         let meta = self.meta()?;
-        let chunk = meta.columns.get(index).ok_or_else(|| {
+        let field = self.schema.fields().get(index).ok_or_else(|| {
             Error::InvalidArgument(format!(
-                "column {index} is out of range for a {}-column segment",
-                meta.columns.len()
+                "column {index} is out of range for a {}-column schema",
+                self.schema.fields().len()
             ))
         })?;
+        let Some(chunk) = meta.columns.get(index) else {
+            return Ok(absent_column(field, meta.row_count.to_native() as usize));
+        };
         let source = SegmentBytes::new(self.bytes.clone());
-        decode_column(chunk, self.schema.field(index).data_type(), &source)
+        decode_column(chunk, field.data_type(), &source)
     }
 
     /// Decode the named columns into a batch.
@@ -419,13 +430,12 @@ impl SegmentReader {
         let columns: Vec<ArrayRef> = indices
             .iter()
             .map(|&i| {
-                let chunk = meta.columns.get(i).ok_or_else(|| {
-                    Error::InvalidArgument(format!(
-                        "column {i} is out of range for a {}-column segment",
-                        meta.columns.len()
-                    ))
-                })?;
-                decode_column(chunk, self.schema.field(i).data_type(), &source)
+                let field = self.schema.field(i);
+                let Some(chunk) = meta.columns.get(i) else {
+                    // Older than the column: no value, so null.
+                    return Ok(absent_column(field, meta.row_count.to_native() as usize));
+                };
+                decode_column(chunk, field.data_type(), &source)
             })
             .collect::<Result<_>>()?;
 
