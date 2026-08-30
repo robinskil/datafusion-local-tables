@@ -347,24 +347,32 @@ several of them and joining the results. Block size should not go below
 costs 2.91 ms raw, 7.54 ms with lz4 and 13.43 ms with zstd. A workload of
 selective queries wants compression; a workload of full scans does not.
 
-### Building an unblocked variable-width column is not free
+### Building a variable-width column costs the whole column, so they are blocked
 
-The raw row in that table is the odd one: 3.41 ms to return one row, ten times
-what lz4 takes. Projecting only the integer column costs 423 us, so the string
-column accounts for about 3 ms of it — to produce one 8192-row page.
+Handing Arrow a column's buffers is not free for a variable-width type.
+`ArrayData::build` walks every offset to check they are ordered and in bounds,
+and for `Utf8` checks every byte is valid text as well. Both cost the whole
+column however few rows were asked for, so reading one 8,192-row page of a
+500,000-row string column paid for all 500,000.
 
-The cost is Arrow's validation. `ArrayData::build` checks a variable-width
-array's offsets across the whole buffer, and for `Utf8` checks the bytes are
-valid text as well, and both are proportional to the whole column rather than
-the range being read. Storing the same bytes as `Binary`, which has no text
-rule, costs 2.27 ms instead of 2.95: the text check is about a quarter of it and
-offset validation is the rest.
+Variable-width columns are therefore cut into blocks whether or not they are
+compressed, and a read is cut at block boundaries so it never has to join two
+together. Building one block costs one block:
 
-A blocked column escapes this by accident, because only the block being read is
-built. It means the reasoning behind leaving uncompressed columns unblocked —
-that blocking would cost them their zero-copy path and buy nothing — is wrong
-for variable-width types, which are paying an O(column) cost per read today.
-Fixed-width columns are unaffected: their validation is O(1).
+| | one row | one row, no text | every row | file |
+| --- | --- | --- | --- | --- |
+| raw, unblocked | 3.02 ms | 430 us | 3.27 ms | 23153 KiB |
+| raw, blocked | **485 us** | 439 us | 3.21 ms | 23175 KiB |
+
+**Six times faster on the selective query, nothing lost on the full scan, and
+0.1% more bytes** for the extra offset each block carries. The middle column is
+the control: it reads no text, and blocking leaves it alone.
+
+Fixed-width columns are not cut. They have no offsets to walk, their checks are
+constant time, and cutting them would only add blocks to stitch together.
+
+An earlier version of this file reported the unblocked figure as a property of
+the format. It was a defect, and this is the fix.
 
 ### Compression dictionaries, and why there are none
 

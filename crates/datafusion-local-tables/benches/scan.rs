@@ -738,7 +738,8 @@ fn page_size_tradeoff(c: &mut Criterion) {
     let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
 
     let cases: Vec<(String, Compression, usize, bool)> = vec![
-        ("raw".to_string(), Compression::None, 0, false),
+        ("raw_unblocked".to_string(), Compression::None, 0, false),
+        ("raw".to_string(), Compression::None, 8192, false),
         ("lz4".to_string(), Compression::Lz4, 8192, false),
         ("zstd_whole".to_string(), Compression::Zstd, 0, false),
         ("zstd_8192".to_string(), Compression::Zstd, 8192, false),

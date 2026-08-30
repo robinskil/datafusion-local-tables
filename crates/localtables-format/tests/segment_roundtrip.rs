@@ -1499,3 +1499,86 @@ async fn block_size_and_page_size_are_independent() {
         &batch.column(0).slice(250, 250)
     );
 }
+
+/// An uncompressed variable-width column is cut into blocks, and a fixed-width
+/// one is not.
+///
+/// The reason is Arrow's, not this format's: handing it a variable-width
+/// column's buffers makes it walk every offset, and for text check every byte,
+/// however few rows are wanted. Building one block costs one block. A
+/// fixed-width column has no offsets to walk and gains nothing from being cut.
+#[tokio::test]
+async fn uncompressed_variable_width_columns_are_blocked_and_numbers_are_not() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("body", DataType::Utf8, false),
+        Field::new("blob", DataType::Binary, false),
+    ]));
+    let ids: Vec<i64> = (0..4_000).collect();
+    let bodies: Vec<String> = ids.iter().map(|i| format!("row {i} padding")).collect();
+    let blobs: Vec<Vec<u8>> = ids.iter().map(|i| format!("blob {i}").into_bytes()).collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(bodies)),
+            Arc::new(BinaryArray::from(
+                blobs.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+
+    let opts = TableOptions {
+        compression_block_rows: 1000,
+        ..options(Compression::None, false)
+    };
+    let (_dir, reader) = round_trip(&schema, std::slice::from_ref(&batch), &opts).await;
+    let meta = reader.meta().unwrap();
+
+    assert_eq!(meta.columns[0].blocks.len(), 0, "a number needs no blocks");
+    assert_eq!(meta.columns[1].blocks.len(), 4, "text is cut");
+    assert_eq!(meta.columns[2].blocks.len(), 4, "binary is cut");
+    assert_eq!(reader.block_rows().unwrap(), 1000);
+
+    // Blocked or not, the answer is the same, and a block is still zero-copy.
+    assert_eq!(reader.read(None).unwrap(), batch);
+    assert!(
+        reader.is_zero_copy(),
+        "cutting an uncompressed column must not cost the zero-copy path"
+    );
+    for (start, len) in [(0, 1), (999, 2), (1000, 1000), (0, 4000), (3999, 1)] {
+        assert_eq!(
+            reader.read_rows(None, start, len).unwrap().column(1),
+            &batch.column(1).slice(start, len),
+            "rows {start}..{}",
+            start + len
+        );
+    }
+}
+
+/// Switching blocks off leaves a column whole, which is what a caller who wants
+/// one contiguous array should get.
+#[tokio::test]
+async fn a_block_size_of_zero_leaves_every_column_whole() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+        "body",
+        DataType::Utf8,
+        false,
+    )]));
+    let bodies: Vec<String> = (0..4_000).map(|i| format!("row {i}")).collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(bodies))],
+    )
+    .unwrap();
+
+    let opts = TableOptions {
+        compression_block_rows: 0,
+        ..options(Compression::None, false)
+    };
+    let (_dir, reader) = round_trip(&schema, std::slice::from_ref(&batch), &opts).await;
+    assert_eq!(reader.meta().unwrap().columns[0].blocks.len(), 0);
+    assert_eq!(reader.block_rows().unwrap(), 0);
+    assert_eq!(reader.read(None).unwrap(), batch);
+}

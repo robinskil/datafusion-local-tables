@@ -693,6 +693,10 @@ impl ColumnarTable {
             None => vec![(0, rows)],
             Some(keep) => kept_ranges(&reader, keep)?,
         };
+        // Cut at block boundaries, so decoding a range never has to join two
+        // blocks together. Each piece then comes out of exactly one block, and
+        // an uncompressed one comes out without a copy.
+        let ranges = split_at_blocks(ranges, reader.block_rows()? as usize);
 
         let mut out = Vec::new();
         for (start, len) in ranges {
@@ -1372,6 +1376,30 @@ fn kept_ranges(reader: &SegmentReader, keep: &[bool]) -> Result<Vec<(usize, usiz
         }
     }
     Ok(ranges)
+}
+
+/// Cut ranges so none of them spans two blocks.
+///
+/// Decoding a range that spans blocks means joining the results, which copies.
+/// Handing back one piece per block avoids that: the scan returns several
+/// batches instead of one, which it was going to do anyway.
+fn split_at_blocks(ranges: Vec<(usize, usize)>, block_rows: usize) -> Vec<(usize, usize)> {
+    if block_rows == 0 {
+        return ranges;
+    }
+    let mut out = Vec::with_capacity(ranges.len());
+    for (start, len) in ranges {
+        let mut at = start;
+        let end = start + len;
+        while at < end {
+            // The end of the block `at` falls in, or the end of the range.
+            let boundary = (at / block_rows + 1) * block_rows;
+            let piece = end.min(boundary) - at;
+            out.push((at, piece));
+            at += piece;
+        }
+    }
+    out
 }
 
 /// Group batches into row groups of at most `max_rows` rows each.

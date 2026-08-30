@@ -263,9 +263,20 @@ column. The chunk then holds no buffers of its own and its blocks hold the data;
 a range inside one block costs one block, and a range spanning several is
 concatenated.
 
-**Only a compressed column is cut.** Cutting an uncompressed one would cost it
-the zero-copy read path, since a range spanning blocks has to be concatenated,
-and would save nothing: there is no decompression to skip.
+A compressed column is always cut, since a block is the unit that can be
+decompressed without decompressing the rest. **A variable-width column is cut
+even when it is not compressed**, for a reason that is Arrow's rather than this
+format's: `ArrayData::build` walks every offset of such a column, and for `Utf8`
+every byte, however few rows were asked for. Building one block costs one block,
+which is worth six times on a selective read of a large text column.
+
+**A fixed-width column is never cut.** Its checks are constant time and it has
+no offsets to walk, so blocking would only add blocks to stitch together.
+
+A read is cut at block boundaries, so decoding never has to join two blocks and
+an uncompressed block is still handed to Arrow as the mapped bytes themselves.
+The scan returns one batch per block rather than one for the range, which it was
+going to slice into batches anyway.
 
 This is separate from `page_rows`, and deliberately. A zone map costs bytes and
 no processor time, so pruning can be finer than decompression. The defaults

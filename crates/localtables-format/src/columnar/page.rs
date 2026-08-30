@@ -272,6 +272,9 @@ pub struct SegmentMeta {
     /// Matched against the table header, so a segment cannot be read with the
     /// wrong schema after a botched recovery.
     pub schema_fingerprint: u64,
+    /// Rows in each block of any column that is stored in blocks. Zero when no
+    /// column is.
+    pub block_rows: u64,
     /// Rows each page of bounds covers. Zero when the segment has none.
     ///
     /// Recorded per segment rather than per column, because a page is a row
@@ -364,6 +367,7 @@ mod tests {
             segment_id: 7,
             row_count: 100,
             schema_fingerprint: 0xdead_beef,
+            block_rows: 0,
             page_rows: 0,
             columns: vec![
                 chunk(Encoding::Plain, Codec::None),
