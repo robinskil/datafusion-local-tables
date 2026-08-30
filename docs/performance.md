@@ -318,6 +318,54 @@ and no processor time, so pruning can be finer than decompression; the defaults
 happen to match, so a page a predicate rules out also costs nothing to
 decompress.
 
+### How small a block is worth making
+
+A smaller block means a selective query decompresses less, and it means the
+codec sees less at a time. Both were measured on a table whose bulk is text that
+does not dictionary encode, 500,000 distinct values in one segment:
+
+| setting | file | one row | every row |
+| --- | --- | --- | --- |
+| raw | 23153 KiB | 3.41 ms | **2.91 ms** |
+| lz4, 8192-row blocks | 9942 KiB | **333 us** | 7.54 ms |
+| zstd, one block | 3297 KiB | 14.31 ms | 11.55 ms |
+| zstd, 8192-row blocks | 4028 KiB | 470 us | 13.43 ms |
+| zstd, 2048-row blocks | 4205 KiB | 542 us | 13.91 ms |
+| zstd, 512-row blocks | 4558 KiB | 870 us | 17.75 ms |
+
+**Blocking is worth 30x on a selective query and costs 22% of the file.** That
+is the whole case for it: whole-column zstd takes 14.31 ms to return one row and
+470 us in blocks.
+
+**Below the page size, smaller blocks are worse on both counts.** Going from
+8192 to 512 rows makes the file 13% larger *and* the query 85% slower. Pruning
+selects whole pages, so a block finer than a page only means decompressing
+several of them and joining the results. Block size should not go below
+`page_rows`, and the defaults match for that reason.
+
+**Compression is a trade against full scans, not a free win.** Reading every row
+costs 2.91 ms raw, 7.54 ms with lz4 and 13.43 ms with zstd. A workload of
+selective queries wants compression; a workload of full scans does not.
+
+### Building an unblocked variable-width column is not free
+
+The raw row in that table is the odd one: 3.41 ms to return one row, ten times
+what lz4 takes. Projecting only the integer column costs 423 us, so the string
+column accounts for about 3 ms of it — to produce one 8192-row page.
+
+The cost is Arrow's validation. `ArrayData::build` checks a variable-width
+array's offsets across the whole buffer, and for `Utf8` checks the bytes are
+valid text as well, and both are proportional to the whole column rather than
+the range being read. Storing the same bytes as `Binary`, which has no text
+rule, costs 2.27 ms instead of 2.95: the text check is about a quarter of it and
+offset validation is the rest.
+
+A blocked column escapes this by accident, because only the block being read is
+built. It means the reasoning behind leaving uncompressed columns unblocked —
+that blocking would cost them their zero-copy path and buy nothing — is wrong
+for variable-width types, which are paying an O(column) cost per read today.
+Fixed-width columns are unaffected: their validation is O(1).
+
 ### Compression dictionaries, and why there are none
 
 A dictionary is the usual answer to small blocks compressing badly: give the

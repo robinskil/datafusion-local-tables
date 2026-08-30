@@ -675,6 +675,110 @@ fn scattered_point_lookup(c: &mut Criterion) {
 
 
 
+
+/// What a smaller compression block buys, and what it costs, on a table whose
+/// bulk is text that does not dictionary encode.
+///
+/// The benchmark fixture elsewhere in this file has only a low-cardinality
+/// string column, which is stored as a dictionary and so has a tiny values
+/// buffer; it cannot show any of this. Here every value is distinct.
+fn page_size_tradeoff(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let text_schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("body", DataType::Utf8, false),
+    ]));
+    let make = |sorted: bool| {
+        let mut bodies: Vec<String> = (0..ROWS)
+            .map(|i| format!("user{i}.{}@mail-{}.example.com", i * 7 % 100_000, i % 32))
+            .collect();
+        if sorted {
+            bodies.sort();
+        }
+        RecordBatch::try_new(
+            text_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((0..ROWS).collect::<Vec<i64>>())),
+                Arc::new(StringArray::from(bodies)),
+            ],
+        )
+        .unwrap()
+    };
+
+    let build = |name: String, compression: Compression, block_rows: usize, sorted: bool| {
+        let schema = text_schema.clone();
+        let path = dir.path().join(format!("{name}.lt"));
+        let batch = make(sorted);
+        runtime.block_on(async move {
+            let table = ColumnarTable::create(
+                &path,
+                schema,
+                TableOptions {
+                    durability: Durability::None,
+                    io_backend: IoBackend::Mmap,
+                    memtable_max_bytes: 512 * 1024 * 1024,
+                    compression,
+                    compression_block_rows: block_rows,
+                    // One segment, so only blocks decide what is decompressed.
+                    min_row_group_rows: ROWS as usize,
+                    row_group_rows: ROWS as usize,
+                    ..TableOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            table.insert(&[batch]).await.unwrap();
+            table.flush().await.unwrap();
+            table
+        })
+    };
+
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+
+    let cases: Vec<(String, Compression, usize, bool)> = vec![
+        ("raw".to_string(), Compression::None, 0, false),
+        ("lz4".to_string(), Compression::Lz4, 8192, false),
+        ("zstd_whole".to_string(), Compression::Zstd, 0, false),
+        ("zstd_8192".to_string(), Compression::Zstd, 8192, false),
+        ("zstd_2048".to_string(), Compression::Zstd, 2048, false),
+        ("zstd_512".to_string(), Compression::Zstd, 512, false),
+        ("zstd_8192_sorted".to_string(), Compression::Zstd, 8192, true),
+    ];
+    for (name, compression, block_rows, sorted) in &cases {
+        ctx.register_table(
+            name.as_str(),
+            Arc::new(ColumnarTableProvider::new(build(
+                name.clone(),
+                *compression,
+                *block_rows,
+                *sorted,
+            ))),
+        )
+        .unwrap();
+        let size = std::fs::metadata(dir.path().join(format!("{name}.lt")))
+            .unwrap()
+            .len();
+        println!("{name:>18} {:>6} KiB", size / 1024);
+    }
+
+    // `id only` reads no text, so the gap between it and `one row` is what
+    // building the string array costs.
+    for (label, sql) in [
+        ("one row", "SELECT * FROM {} WHERE id = 372145"),
+        ("one row, id only", "SELECT id FROM {} WHERE id = 372145"),
+        ("every row", "SELECT max(character_length(body)) FROM {}"),
+    ] {
+        let mut group = c.benchmark_group(format!("block size: {label}"));
+        for (name, ..) in &cases {
+            let sql = sql.replace("{}", name);
+            group.bench_function(name.as_str(), |b| b.iter(|| run(&ctx, &runtime, &sql)));
+        }
+        group.finish();
+    }
+}
+
 /// What compressing a column actually costs a query, and what it saves.
 ///
 /// The read path is zero-copy only while a column is stored raw, so a codec is
@@ -1084,6 +1188,7 @@ criterion_group!(
     scattered_point_lookup,
     page_pruning,
     compression_choice,
+    page_size_tradeoff,
     substring_search,
     clustered_layout,
     small_writes
