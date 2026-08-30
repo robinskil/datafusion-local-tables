@@ -2,36 +2,39 @@
 
 DataFusion table providers backed by a single local file.
 
-Local files permit things an object store cannot: memory mapping, io_uring, and
-handing the page cache straight to a query with no copy in between.
+A local file permits what an object store cannot. It permits memory maps,
+io_uring, and the page cache given straight to a query with no copy between.
 
-The table is parquet-like: zone maps, membership filters, dictionary and
-run-length encodings, per-page compression. It supports inserts, deletes and
-updates, and is built for fast, memory-efficient scans.
+The table is parquet-like. It has zone maps, membership filters, dictionary and
+run-length encodings, and per-column compression. It takes inserts, deletes and
+updates. It is built for fast scans that use little memory.
 
-Scans divide across threads at segment granularity, which is this format's row
-group — the same unit a parquet reader divides a file by.
+A scan divides across threads at segment granularity. A segment is this format's
+row group, the same unit a parquet reader divides a file by.
 
-Arrow is the in-memory model. Metadata is stored as [rkyv](https://rkyv.org)
-archives and read in place. Column data is stored as raw Arrow buffers, so a
-scan can map a segment and build a `RecordBatch` over it without copying, and
-can decode one column without touching the others.
+Arrow is the in-memory model. Metadata sits in [rkyv](https://rkyv.org) archives
+and reads in place. Column data sits in raw Arrow buffers. A scan can map a
+segment and build a `RecordBatch` over it with no copy. It can also decode one
+column and leave the others alone.
 
-A column can hold any Arrow type. The format stores what Arrow lays out — a
-null bitmap, the array's buffers, its child arrays — so nested types,
-dictionaries and extension types work without being enumerated anywhere.
-GeoArrow geometries round-trip, four levels of nesting and extension metadata
-included. Zone maps stay type-specific: a type with no order this format can
-record simply prunes nothing.
+A column can hold any Arrow type. The format stores what Arrow lays out: a null
+bitmap, the array's buffers, and its child arrays. Nested types, dictionaries
+and extension types all work, and nothing enumerates them.
 
-Zone maps prune by range, which leaves two cases they cannot help with. A column
-of scattered values has every segment's range covering the value being looked
-for, and a substring search is not a range at all. A column can opt into a
-membership filter for the first and a trigram filter for the second.
+GeoArrow geometries round-trip, with four levels of nesting and their extension
+metadata. Zone maps stay type-specific. A type with no order this format can
+record prunes nothing.
+
+Zone maps prune by range. That leaves two cases they cannot help with. On a
+column of scattered values, every segment's range covers the value. A substring
+search is not a range at all.
+
+A column can ask for a membership filter for the first case. It can ask for a
+trigram filter for the second.
 
 Row order is a third lever. A zone map is selective on a column only when the
-rows follow that column's order, and only one column can have that; writing rows
-in z-order interleaves several columns so a segment covers a box in all of them.
+rows follow that column's order, and only one column can have that. A z-order
+interleaves several columns, so a segment covers a box in all of them.
 
 ## Layout
 
@@ -44,28 +47,29 @@ in z-order interleaves several columns so a segment covers a box in all of them.
 
 Under construction.
 
-The table works end to end: `SELECT`, `INSERT`, `DELETE` and `UPDATE` through
-SQL, with zone-map, membership-filter and trigram pruning, optional z-order
-clustering, projection and limit pushdown, crash-safe commits, a write-ahead
-log, and compaction.
+The table works end to end. It takes `SELECT`, `INSERT`, `DELETE` and `UPDATE`
+through SQL. It prunes by zone map, membership filter and trigram filter. It
+also offers z-order clustering, projection and limit pushdown, crash-safe
+commits, a write-ahead log, and compaction.
 
-Filters and clustering are per-segment, so a table changes them by being
-rewritten: reopen with the options you want and call `rewrite_all`. Rewrites are
-cut into runs of bounded size rather than reading the whole table into memory,
-so a table larger than memory can still be compacted.
+A segment fixes its filters and its row order when the writer writes it. A table
+changes them by a rewrite. Open the table with the options you want, then call
+`rewrite_all`.
 
-The schema can change too. Adding a nullable column and renaming one are single
-small commits; dropping a column and changing its type rewrite every segment, in
-the same commit as the schema, so a segment always matches the schema it is read
-under and zone maps and filters stay usable.
+A rewrite is cut into runs of bounded size. It does not read the whole table
+into memory, so a table larger than memory can still be compacted.
 
-Three IO backends: mmap (default), positional reads, and io_uring on Linux.
-The io_uring backend compiles for Linux but has not been run. See
+The schema can change too. To add a nullable column, or to rename one, is one
+small commit. To drop a column, or to change its type, rewrites every segment in
+the same commit as the schema. A segment therefore always matches the schema it
+is read under, and zone maps and filters stay usable.
+
+There are three IO backends: mmap by default, positional reads, and io_uring on
+Linux. The io_uring backend compiles for Linux. Nobody has run it. See
 `docs/format.md` for the on-disk layout.
 
-An earlier version carried a second table kind, a copy-on-write b-tree for
-point lookups. It was removed: a file written by it cannot be opened by this
-build.
+An earlier version carried a second table kind: a copy-on-write b-tree for point
+lookups. It was removed. This build cannot open a file that version wrote.
 
 ## Example
 
@@ -104,22 +108,25 @@ async fn example() -> Result<(), Box<dyn std::error::Error>> {
 cargo bench -p datafusion-local-tables
 ```
 
-Runs the same queries against a local table and an equivalent parquet file
-through the same DataFusion session, so what is measured is the storage layer
-rather than the query engine.
+This runs the same queries against a local table and an equivalent parquet
+file, in one DataFusion session. The measurement is of the storage layer, not
+the query engine.
 
-Scans come out about twice as fast as parquet, which is the zero-copy read path
-doing what it exists for. Group-by on a string column is slower, because
-DataFusion's parquet reader turns the column into `Utf8View` and this crate
-returns the type the schema declares. See `docs/performance.md` for the numbers
-and what they do and do not establish.
+Scans come out about twice as fast as parquet. That is the zero-copy read path
+doing what it exists for.
+
+A group-by on a string column is slower. DataFusion's parquet reader turns the
+column into `Utf8View`, and this crate returns the type the schema declares. See
+`docs/performance.md` for the numbers, and for what they do and do not
+establish.
 
 ## Format stability
 
-The on-disk format is not stable yet. rkyv does not guarantee that archived
-layouts survive a version bump, so the file header carries a format version and
-an rkyv upgrade counts as a format change. Until version 1.0, expect to rewrite
-tables rather than migrate them.
+The on-disk format is not stable yet. rkyv does not promise that an archived
+layout survives a version bump. So the file header carries a format version, and
+an rkyv upgrade counts as a format change.
+
+Before version 1.0, rewrite tables. Do not expect to migrate them.
 
 ## Licence
 

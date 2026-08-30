@@ -1,10 +1,11 @@
 # Measured performance
 
 Numbers from `cargo bench -p datafusion-local-tables`, on an Apple M-series
-laptop, 500,000 rows in ten segments of 50,000. The same data is written to a
-local table and to a parquet file with matching row groups, and every query
-runs through the same DataFusion session, so what is compared is the storage
-layer rather than the query engine.
+laptop. 500,000 rows in ten segments of 50,000.
+
+The same data goes to a local table and to a parquet file with matching row
+groups. Every query runs in one DataFusion session. The comparison is of the
+storage layer, not the query engine.
 
 Only compare numbers within one table below. Each table is one benchmark run;
 absolute timings drift by tens of percent between runs depending on what else
@@ -14,11 +15,11 @@ the machine is doing, so cross-table comparisons are not meaningful.
 
 Three tables appear in each result:
 
-* **local** — a local table with the writer's default encodings, which means it
-  may choose dictionary or run-length encoding when they make a column smaller;
-* **plain** — the same data with re-encoding switched off, so every column is
-  stored as raw Arrow buffers;
-* **pq** — parquet, read by DataFusion's own reader.
+* **local** is a local table with the writer's default encodings. The writer may
+  choose dictionary or run-length encoding when they make a column smaller.
+* **plain** is the same data with re-encoding off. Every column is stored as raw
+  Arrow buffers.
+* **pq** is parquet, read by DataFusion's own reader.
 
 | query | local | plain | parquet |
 | --- | --- | --- | --- |
@@ -64,8 +65,8 @@ Reading the same file both ways, in one run:
 | `Utf8View` (the default) | **1.62 ms** |
 | `Utf8` | 2.59 ms |
 
-So the reader's choice of type accounts for a 1.6× difference on its own — more
-than the whole gap against this crate.
+So the reader's choice of type accounts for a 1.6x difference on its own. That
+is more than the whole gap against this crate.
 
 Declaring the column `Utf8View` here does not close it, though. In one run:
 
@@ -85,16 +86,20 @@ explaining. `tests/profile_views.rs` takes it apart.
 
 Three effects, measured separately. Values are five bytes unless stated.
 
-**The column is bigger.** A view is a flat sixteen bytes per row whatever the
-value; an offset plus five bytes of data is nine. So the `Utf8View` column is
-8.0 MB against 4.5 MB — 1.78x — and every read pays for it. At forty-byte
-values the gap narrows to 1.27x, and the read cost narrows with it, which is
-what says the size is doing the work.
+**The column is bigger.** A view is a flat sixteen bytes per row, whatever the
+value. An offset plus five bytes of data is nine.
 
-**Validating UTF-8 costs more for the view layout.** Decoding checks what came
-off disk rather than trusting it, and for a string column that includes UTF-8.
-For `Utf8` that is one pass over a contiguous buffer; for `Utf8View` it is a
-separate check per value. Comparing types that differ in nothing else:
+So the `Utf8View` column is 8.0 MB against 4.5 MB, which is 1.78x. Every read
+pays for it.
+
+At forty-byte values the gap narrows to 1.27x, and the read cost narrows with
+it. That is what says the size is doing the work.
+
+**UTF-8 validation costs more for the view layout.** A decode checks what came
+off disk. It does not trust it. For a string column that check includes UTF-8.
+
+For `Utf8` that is one pass over a contiguous buffer. For `Utf8View` it is a
+separate check per value. Compare types that differ in nothing else:
 
 | column type | stored bytes | decode |
 | --- | --- | --- |
@@ -107,26 +112,30 @@ separate check per value. Comparing types that differ in nothing else:
 Arrow has to check it is UTF-8. `BinaryView` decodes 2.8x faster. That check is
 the whole of the cost that size does not explain.
 
-**Views do make grouping cheaper — while values stay short.** Grouping cost
-alone: 0.58 ms for `Utf8View` against 0.92 ms for `Utf8`. At forty-byte values,
-where nothing fits inline in a view any more, it reverses: 1.59 ms against
-1.13 ms.
+**Views do make a group by cheaper, while values stay short.** The group by
+alone costs 0.58 ms for `Utf8View` against 0.92 ms for `Utf8`.
 
-Added up, the first two exceed the third, and the view column loses. Parquet
-does not face this trade because its stored representation and the type it
-hands back are unrelated: it stores compact, dictionary-encoded pages and
-materialises views in memory, so it takes the grouping win without paying for
-sixteen bytes a row on disk. Doing the same here would mean choosing the output
-type at scan time rather than storing what the schema says — a real design
-option, and not one this crate takes today.
+At forty-byte values nothing fits inline in a view any more, and it reverses:
+1.59 ms against 1.13 ms.
 
-There is also a lever on the validation cost: every buffer already carries an
-xxh3 checksum that is verified before decode, so Arrow's revalidation is
-redundant for a file this crate wrote. Skipping it with `build_unchecked` would
-recover most of that 2.8x. It is not taken, and should not be taken lightly: a
-checksum proves the bytes are the bytes that were written, not that they were
-ever valid, and unchecked construction turns a bad file into undefined
-behaviour rather than an error.
+Added up, the first two exceed the third, and the view column loses.
+
+Parquet does not face this trade. Its stored form and the type it returns are
+unrelated. It stores compact dictionary pages and builds views in memory. It
+takes the group by win and pays nothing for sixteen bytes a row on disk.
+
+To do the same here would mean a choice of output type at scan time, rather than
+storage of what the schema says. That is a real design option. This crate does
+not take it today.
+
+There is also a lever on the validation cost. Every buffer carries an xxh3
+checksum, and a decode verifies it. Arrow's revalidation is therefore redundant
+for a file this crate wrote. `build_unchecked` would recover most of that 2.8x.
+
+This crate does not take that lever, and nobody should take it lightly. A
+checksum proves the bytes are the bytes that were written. It does not prove
+they were ever valid. Unchecked construction turns a bad file into undefined
+behaviour, not an error.
 
 ## What dictionary columns did and did not do
 
@@ -141,10 +150,11 @@ in one run:
 | parquet, dictionary column | 2.99 ms |
 
 On a dictionary column this crate is now slightly faster than parquet. But both
-are slower than the same query over a plain `Utf8` column, so declaring a column
-as a dictionary is not a way to make a group by faster — it is a way to make the
-file smaller. The theory it was added on was wrong; the capability is still
-worth having, because before it a dictionary column could not be stored at all.
+are slower than the same query over a plain `Utf8` column.
+
+So a dictionary column is not a way to make a group by faster. It is a way to
+make the file smaller. The theory this was added on was wrong. The capability is
+still worth having: before it, a dictionary column could not be stored at all.
 
 ## Membership filters
 
@@ -190,8 +200,8 @@ term, all three built in one run:
 | parquet | 4.12 ms |
 
 **A trigram filter is worth 2.7 times on this query.** Parquet is the reference
-for reading everything, since it has no substring index to switch on: this is
-not a like-for-like comparison the way the point lookup above is.
+for a read of everything. It has no substring index to switch on. This is not a
+like-for-like comparison, as the point lookup above is.
 
 The filter costs little on text and more on identifiers, because it is sized by
 distinct trigrams and prose repeats its own heavily. Whole-file sizes over
@@ -216,10 +226,12 @@ rows a segment is cheap enough that ruling out six of them saves only a fifth of
 the query.
 
 That gap is the useful part of this measurement. Clustering pays in proportion
-to what a segment costs to read, so it should matter more on wider rows, larger
-tables, and reads that miss the page cache. **None of those are measured here**,
-and this benchmark is a warm, memory-mapped, half-million-row table. Do not read
-the 20% as the number for a larger one in either direction.
+to what a segment costs to read. It should matter more on wider rows, on larger
+tables, and on reads that miss the page cache.
+
+**None of those are measured here.** This benchmark is a warm, memory-mapped,
+half-million-row table. Do not read the 20% as the number for a larger one, in
+either direction.
 
 Clustering also costs write time, since the rows have to be reordered. That is
 not measured either.
@@ -227,9 +239,11 @@ not measured either.
 ## Page bounds inside a segment
 
 Bounds recorded for each row range inside a segment let a scan decode and hand
-on one page rather than the whole segment. Measured on 500,000 rows in a single
-segment, so a segment zone map rules nothing out and page bounds are the only
-thing left to prune with. All six built in one run:
+on one page, not the whole segment.
+
+Measured on 500,000 rows in a single segment. A segment zone map then rules
+nothing out, and page bounds are the only thing left to prune with. All six
+built in one run:
 
 | variant | `WHERE id = 372145` |
 | --- | --- |
@@ -241,11 +255,12 @@ thing left to prune with. All six built in one run:
 | parquet, page index | 0.61 ms |
 
 **Page bounds are worth 2.65x on a table with encodings on.** They are worth
-much less on plain columns, 1.27x, and the difference between those two rows is
-the whole mechanism: what a page skips is the work of *expanding* it. A plain
-column is buffer wrapping and costs almost nothing to skip; a dictionary column
-has to be turned back into the type the schema declares, and that is work
-proportional to the rows expanded.
+much less on plain columns: 1.27x.
+
+The difference between those two rows is the whole mechanism. What a page skips
+is the work of *expanding* it. A plain column is buffer wrapping, and costs
+almost nothing to skip. A dictionary column must go back to the type the schema
+declares, and that work is proportional to the rows expanded.
 
 That only became true when the decoder learned to build a range. Before it did,
 a segment was decoded whole and then sliced, and these same bounds bought
@@ -295,12 +310,16 @@ than raw and 2% slower on the worst of the three queries, which is why it is the
 default. Compressing everything reaches 42% and 69% smaller and costs 42% and
 202% on a read of every column.
 
-Two things worth noticing. The string group by is unmoved by any setting,
-because that column is low cardinality and already dictionary encoded, so its
-values buffer is tiny whatever wraps it. And lz4 everywhere costs almost nothing
-on the full scan, because the column it reads did not shrink and the writer
-therefore stored it raw: a codec that fails to earn its place is dropped per
-buffer, which protects the zero-copy path without anyone choosing anything.
+Two things are worth notice.
+
+The string group by does not move under any setting. That column is low
+cardinality and already dictionary encoded, so its values buffer is tiny
+whatever wraps it.
+
+lz4 everywhere costs almost nothing on the full scan. The column it reads did
+not shrink, so the writer stored it raw. A codec that fails to earn its place is
+dropped per buffer. That protects the zero-copy path with nobody choosing
+anything.
 
 ### Blocks, and what they cost
 
@@ -316,9 +335,11 @@ cut off.
 | zstd everywhere | 4309 KiB | 4556 KiB | 1.24 ms | **500 us** |
 
 **Blocking costs the default 0.23% and buys zstd 2.5x.** It is close to free for
-lz4, which is why it is on by default, and it is what makes zstd usable at all
-for a selective query: whole-column zstd was three times slower than storing
-raw, and in blocks it is 21% slower at a third of the size.
+lz4, which is why it is on by default.
+
+It is also what makes zstd usable for a selective query at all. Whole-column
+zstd was three times slower than raw storage. In blocks it is 21% slower at a
+third of the size.
 
 The block size is separate from `page_rows` on purpose. A zone map costs bytes
 and no processor time, so pruning can be finer than decompression; the defaults
@@ -344,15 +365,18 @@ does not dictionary encode, 500,000 distinct values in one segment:
 is the whole case for it: whole-column zstd takes 14.31 ms to return one row and
 470 us in blocks.
 
-**Below the page size, smaller blocks are worse on both counts.** Going from
-8192 to 512 rows makes the file 13% larger *and* the query 85% slower. Pruning
-selects whole pages, so a block finer than a page only means decompressing
-several of them and joining the results. Block size should not go below
+**Below the page size, smaller blocks are worse on both counts.** From 8192 to
+512 rows makes the file 13% larger *and* the query 85% slower.
+
+Pruning selects whole pages. A block finer than a page only means several
+decompressions and a join of the results. Block size should not go below
 `page_rows`, and the defaults match for that reason.
 
-**Compression is a trade against full scans, not a free win.** Reading every row
-costs 2.91 ms raw, 7.54 ms with lz4 and 13.43 ms with zstd. A workload of
-selective queries wants compression; a workload of full scans does not.
+**Compression is a trade against full scans, not a free win.** A read of every
+row costs 2.91 ms raw, 7.54 ms with lz4, and 13.43 ms with zstd.
+
+A workload of selective queries wants compression. A workload of full scans does
+not.
 
 ### Building a variable-width column costs the whole column, so they are blocked
 
@@ -362,9 +386,9 @@ and for `Utf8` checks every byte is valid text as well. Both cost the whole
 column however few rows were asked for, so reading one 8,192-row page of a
 500,000-row string column paid for all 500,000.
 
-Variable-width columns are therefore cut into blocks whether or not they are
-compressed, and a read is cut at block boundaries so it never has to join two
-together. Building one block costs one block:
+So variable-width columns go into blocks whether or not they are compressed. A
+read is cut at block boundaries, and never has to join two together. One block
+costs one block:
 
 | | one row | one row, no text | every row | file |
 | --- | --- | --- | --- | --- |
@@ -397,10 +421,11 @@ one block:
 | 70 KiB | +74.5% | +86.2% | +78.4% | +1.5% | +0.5% |
 | 280 KiB | +56.5% | +61.4% | +54.8% | +0.4% | +0.1% |
 
-**A dictionary makes zstd worse at every block size tried**, and the trained one
-is worse than the raw content one at the sizes where it matters. It reaches
-break-even only at 280 KiB blocks, where blocking costs least and a dictionary
-is needed least.
+**A dictionary makes zstd worse at every block size tried.** The trained one is
+worse than the raw content one at the sizes that matter.
+
+It reaches break-even only at 280 KiB blocks. That is where blocking costs least
+and a dictionary is needed least.
 
 For lz4 a content dictionary does help, and the help is worth 0.3% at the block
 size this format uses, while costing 30% on decompression: 49.6 us per block
@@ -418,11 +443,15 @@ its own to reference. Blocks here are sized in rows, so even 512 rows of text is
 are single-digit kilobytes.
 
 One thing the table does say: **zstd loses far more to blocking on real text
-than the benchmark fixture suggests.** That fixture's only string column is low
-cardinality and dictionary encoded, so its values buffer is tiny; blocking cost
-it 5.7%. A column of genuinely distinct text costs 56.5% at the default block
-size. A table with text columns that wants zstd should raise
-`compression_block_rows`, and give up some of the skipping to get it back.
+than the benchmark fixture suggests.**
+
+That fixture's only string column is low cardinality and dictionary encoded, so
+its values buffer is tiny. Blocking cost it 5.7%. A column of genuinely distinct
+text costs 56.5% at the default block size.
+
+A table with text columns that wants zstd should raise
+`compression_block_rows`. It gives up some of the skipping to get the ratio
+back.
 
 ## What the filters cost to write
 
@@ -466,18 +495,25 @@ measurable. Scanning the same 500,000 rows cut different ways, all in one run:
 | 20 | 532 µs | 324 µs | 348 µs |
 | 70 | 736 µs | 458 µs | 572 µs |
 
-A segment is not free: a mapping, a metadata frame to verify, a set of zone
-maps, about five microseconds each. Read down the one-partition column and that
-cost is plain — 428 µs to 736 µs for the same rows. Read across and the benefit
-is plain too, until there are so many segments that their overhead swamps it.
-The flat region here is five to twenty; `TARGET_ROW_GROUPS` is set to eight to
-land in it.
+A segment is not free. It costs a mapping, a metadata frame to verify, and a set
+of zone maps: about five microseconds each.
 
-More partitions than four buys nothing on this query, and that is not about
-segments. Fitting `total = fixed + work / threads` puts roughly 280 µs of it in
-costs that do not divide — planning, the final aggregation, spawning the tasks —
-and only about 175 µs in the scan. The scan part divides as expected; it is the
-smaller half of a query this cheap.
+Read down the one-partition column and that cost is plain, at 428 us to 736 us
+for the same rows. Read across and the benefit is plain too, until so many
+segments exist that their overhead swamps it.
+
+The flat region here is five to twenty segments. `TARGET_ROW_GROUPS` is eight,
+to land in it.
+
+More than four partitions buys nothing on this query, and that is not about
+segments.
+
+Fit `total = fixed + work / threads`. About 280 us of it sits in costs that do
+not divide: planning, the final aggregation, and the task spawns. Only about
+175 us sits in the scan.
+
+The scan part divides as expected. It is the smaller half of a query this
+cheap.
 
 ### Uneven segments
 
@@ -490,23 +526,27 @@ spread over twenty small ones.
 | 4 | **359 µs** |
 | 8 | 406 µs |
 
-It divides, but this does not establish that taking from a queue beat the fixed
-split it replaced — that would need both implementations measured side by side,
-and only one of them still exists. The argument for it is that the pieces are
-genuinely unequal, so a split fixed before any of them is read is guessing; the
-evidence here is only that the result is correct and not slower.
+It divides. That does not establish that a shared queue beat the fixed split it
+replaced. Such a claim needs both implementations measured side by side, and
+only one of them still exists.
+
+The argument for the queue is that the pieces are genuinely unequal, so a split
+fixed before any of them is read is a guess. The evidence here is only that the
+result is correct and not slower.
 
 ## Small writes
 
-`small insert/100 rows` measures a hundred separate one-row inserts, each
-durable before the next: about 0.83 ms in total, or 8 µs per insert. That is
-the write-ahead log doing its job — a one-row insert appends a record and
-returns, rather than building a segment.
+`small insert/100 rows` measures a hundred separate one-row inserts. Each one is
+durable before the next. Together they take about 0.83 ms, or 8 us per insert.
 
-Note that these benchmarks run with `Durability::None`, so no `fsync` is
-involved. With a real durability setting the cost per insert is dominated by
-the disk, and the group-commit path — several rows in one call, one sync —
-matters far more than anything in this crate.
+That is the write-ahead log doing its job. A one-row insert appends a record and
+returns. It does not build a segment.
+
+Note that these benchmarks run with `Durability::None`, so no `fsync` happens.
+
+With a real durability setting, the disk dominates the cost per insert. The
+group-commit path then matters far more than anything in this crate: several
+rows in one call, one sync.
 
 ## Reading the caveats
 
