@@ -334,7 +334,15 @@ frame, so it costs nothing to open a segment that has one. Pruning reads only
 the filters for columns a predicate actually mentions.
 
 Values hash through `valuecodec`, the same canonical byte form for a value in a
-column and a literal in a predicate. A literal of a different type is cast
+column and a literal in a predicate. A view array encodes to the same bytes as
+its plain form, so a `Utf8View` column gets the same filter a `Utf8` one would:
+DataFusion asks for view types by default, and without that a string column
+would usually have no filter at all.
+
+Filters are sized by the number of *distinct* values, not rows. A column of a
+thousand rows holding eight values needs room for eight, which matters most
+where a filter is useless anyway: if every segment holds every value it can
+never rule one out, and sizing by rows would spend real bytes saying so. A literal of a different type is cast
 first; one that cannot be cast, or that casts to null, is unknown rather than
 absent.
 

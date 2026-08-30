@@ -95,6 +95,12 @@ pub fn encode_value(out: &mut Vec<u8>, array: &dyn Array, row: usize) -> Result<
         DataType::LargeUtf8 => encode_bytes(out, array.as_string::<i64>().value(row).as_bytes()),
         DataType::Binary => encode_bytes(out, array.as_binary::<i32>().value(row)),
         DataType::LargeBinary => encode_bytes(out, array.as_binary::<i64>().value(row)),
+        // A view array holds the same text behind a different layout, so it
+        // encodes to the same bytes. Worth having: DataFusion asks for view
+        // types by default, so without these a string column would often have
+        // no canonical form and so no membership filter.
+        DataType::Utf8View => encode_bytes(out, array.as_string_view().value(row).as_bytes()),
+        DataType::BinaryView => encode_bytes(out, array.as_binary_view().value(row)),
 
         other => {
             return Err(Error::Unsupported(format!(
@@ -192,6 +198,8 @@ pub fn is_encodable(data_type: &DataType) -> bool {
             | DataType::LargeUtf8
             | DataType::Binary
             | DataType::LargeBinary
+            | DataType::Utf8View
+            | DataType::BinaryView
     )
 }
 

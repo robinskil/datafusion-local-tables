@@ -33,14 +33,21 @@ doing what it exists for: the segment is mapped, and the Arrow buffers a query
 receives point into the page cache. Nothing is decompressed, decoded, or
 copied.
 
-**Re-encoding costs reads.** Compare `local` against `plain`: dictionary
-encoding a low-cardinality string column makes the file smaller, but the point
-lookup pays 29% for it and the group by pays 23%. The column has to be expanded
-back to the type the schema declares, and that expansion is a full pass over it.
+**Re-encoding costs a read that touches every row, and no longer costs a
+selective one.** Compare `local` against `plain`. The point lookup was paying
+29% for dictionary encoding and now pays nothing measurable, 429 us against 425:
+the expansion is scoped to the rows a scan asks for, so a query that wants one
+page expands one page. The group by still pays, 1.81 ms against 1.41, because it
+wants every row and there is no smaller set to expand.
+
 The writer chooses an encoding purely on the size it saves; it does not know
 what a read will cost. Switching re-encoding off with
-`TableOptions { dictionary_encoding: false, rle_encoding: false, .. }` is the
-right choice for a read-heavy table that fits comfortably on disk.
+`TableOptions { dictionary_encoding: false, rle_encoding: false, .. }` is still
+the right choice for a table that is scanned whole and fits comfortably on disk.
+
+An earlier version of this section reported the point lookup figure as 29%. That
+was measured before the decoder learned to build a range, and is no longer
+true.
 
 ## Where parquet wins the string group by
 
@@ -416,6 +423,32 @@ cardinality and dictionary encoded, so its values buffer is tiny; blocking cost
 it 5.7%. A column of genuinely distinct text costs 56.5% at the default block
 size. A table with text columns that wants zstd should raise
 `compression_block_rows`, and give up some of the skipping to get it back.
+
+## What the filters cost to write
+
+Both filters are off by default, and these are the figures behind that. On
+500,000 distinct email-shaped strings, against building the same segment
+without them:
+
+| | file | segment build |
+| --- | --- | --- |
+| neither | 23154 KiB | 61.9 ms |
+| membership filter | 24375 KiB (+5.3%) | 122.1 ms (**+97%**) |
+| trigram filter | 23156 KiB (+0.01%) | 66.1 ms (+7%) |
+
+**A membership filter nearly doubles the cost of writing a segment**, because it
+puts every value through the canonical encoder and hashes it. The trigram filter
+is nearly free on this text, since it is sized by distinct trigrams and email
+addresses draw on a small alphabet; a column of random alphanumeric identifiers
+costs 16% instead.
+
+Neither slows a read that does not use it. They are stored as buffers the
+decoder skips and are read only when a predicate mentions that column. So the
+cost is bytes and write time, and the benefit is confined to equality and `LIKE`
+on that column: 1.55x and 2.7x on the queries they target.
+
+That is why they are asked for rather than assumed. A table that filters on a
+text column should turn them on; one that does not would pay for nothing.
 
 ## Parallel scans
 

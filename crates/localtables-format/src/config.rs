@@ -95,6 +95,14 @@ impl BloomFilters {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Compression {
     /// Store raw Arrow bytes. Keeps the zero-copy read path everywhere.
+    ///
+    /// The default, because a codec is the one thing that takes that path away,
+    /// and this format exists to have it. On a table whose bulk is text,
+    /// compressing costs 2.3x on a full scan for 2.3x the size back; on one
+    /// whose text is low cardinality it costs 2%. Which of those a table gets
+    /// depends on its data, so the cheap answer is the default and
+    /// [`Compression::Auto`] is one line away.
+    #[default]
     None,
     /// Compress the columns that gain by it and leave the rest raw.
     ///
@@ -106,8 +114,12 @@ pub enum Compression {
     /// Measured over 500,000 rows against storing everything raw: 14% smaller,
     /// and 2% slower on the worst of three queries tried. Compressing every
     /// column instead reaches 42% smaller with lz4 and 69% with zstd, and costs
-    /// 42% and 202% on a read of every column. That is the trade this declines.
-    #[default]
+    /// 42% and 202% on a read of every column.
+    ///
+    /// On a table that is mostly high-cardinality text the trade is much
+    /// sharper than that mixed figure suggests: 2.3x smaller, point lookups a
+    /// quarter faster, and full scans 2.3x slower. Worth asking for when size
+    /// matters more than scan throughput, which is why it is not the default.
     Auto,
     /// lz4 for every column, whatever it holds.
     Lz4,

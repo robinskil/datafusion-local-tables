@@ -721,14 +721,43 @@ fn write_cost(c: &mut Criterion) {
     )
     .unwrap();
 
-    let settings: Vec<(&str, Compression, usize)> = vec![
-        ("raw, unblocked", Compression::None, 0),
-        ("raw, blocked", Compression::None, 8192),
-        ("lz4, blocked", Compression::Lz4, 8192),
-        ("lz4, unblocked", Compression::Lz4, 0),
-        ("zstd, blocked", Compression::Zstd, 8192),
-        ("zstd, unblocked", Compression::Zstd, 0),
-        ("zstd, 512-row blocks", Compression::Zstd, 512),
+    let base = TableOptions {
+        durability: Durability::None,
+        ..TableOptions::default()
+    };
+    let settings: Vec<(&str, TableOptions)> = vec![
+        ("raw, unblocked", TableOptions { compression_block_rows: 0, ..base.clone() }),
+        ("raw, blocked", base.clone()),
+        ("lz4, blocked", TableOptions { compression: Compression::Lz4, ..base.clone() }),
+        (
+            "lz4, unblocked",
+            TableOptions { compression: Compression::Lz4, compression_block_rows: 0, ..base.clone() },
+        ),
+        ("zstd, blocked", TableOptions { compression: Compression::Zstd, ..base.clone() }),
+        (
+            "zstd, unblocked",
+            TableOptions { compression: Compression::Zstd, compression_block_rows: 0, ..base.clone() },
+        ),
+        (
+            "zstd, 512-row blocks",
+            TableOptions { compression: Compression::Zstd, compression_block_rows: 512, ..base.clone() },
+        ),
+        (
+            "+ membership filter",
+            TableOptions { bloom_filters: BloomFilters::All, ..base.clone() },
+        ),
+        (
+            "+ trigram filter",
+            TableOptions { trigram_filters: BloomFilters::All, ..base.clone() },
+        ),
+        (
+            "+ both filters",
+            TableOptions {
+                bloom_filters: BloomFilters::All,
+                trigram_filters: BloomFilters::All,
+                ..base.clone()
+            },
+        ),
     ];
 
     for (label, schema, batch) in [
@@ -738,17 +767,11 @@ fn write_cost(c: &mut Criterion) {
         let layout = SchemaLayout::of(schema);
         let mut group = c.benchmark_group(format!("write: {label}"));
         group.throughput(Throughput::Elements(ROWS as u64));
-        for (name, compression, block_rows) in &settings {
-            let options = TableOptions {
-                durability: Durability::None,
-                compression: *compression,
-                compression_block_rows: *block_rows,
-                ..TableOptions::default()
-            };
+        for (name, options) in &settings {
             // Report what a flush would hand the disk, so the processor cost
             // and the bytes it saves can be read together.
             let built =
-                build_segment(0, schema, layout.current(), std::slice::from_ref(batch), &options)
+                build_segment(0, schema, layout.current(), std::slice::from_ref(batch), options)
                     .unwrap();
             println!("write {label:>8} {name:<22} {:>6} KiB", built.bytes.len() / 1024);
 
@@ -759,7 +782,7 @@ fn write_cost(c: &mut Criterion) {
                         schema,
                         layout.current(),
                         std::slice::from_ref(batch),
-                        &options,
+                        options,
                     )
                     .unwrap()
                 })

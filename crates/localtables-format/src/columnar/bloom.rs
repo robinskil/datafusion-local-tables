@@ -146,16 +146,19 @@ impl BloomFilter {
     ///
     /// Nulls are left out: `col = x` is never true of a null, so a filter that
     /// knew about them would only be larger.
+    ///
+    /// Sized by the number of *distinct* values, not the number of rows.
+    /// Inserting the same value twice tells a filter nothing, so a column of a
+    /// thousand rows holding eight values needs room for eight. That matters
+    /// most for the column where a filter is useless anyway: if every segment
+    /// holds every value, the filter can never rule one out, and sizing it by
+    /// rows would spend real bytes saying so.
     pub fn build(array: &dyn Array, bits_per_value: usize) -> Result<Option<Self>> {
         if !supports(array.data_type()) || array.is_empty() {
             return Ok(None);
         }
-        let live = array.len() - array.null_count();
-        if live == 0 {
-            return Ok(None);
-        }
 
-        let mut filter = Self::with_capacity(live, bits_per_value);
+        let mut hashes = std::collections::HashSet::new();
         let mut bytes = Vec::with_capacity(32);
         for row in 0..array.len() {
             if array.is_null(row) {
@@ -163,7 +166,15 @@ impl BloomFilter {
             }
             bytes.clear();
             valuecodec::encode_value(&mut bytes, array, row)?;
-            filter.insert_hash(crate::layout::checksum(&bytes));
+            hashes.insert(crate::layout::checksum(&bytes));
+        }
+        if hashes.is_empty() {
+            return Ok(None);
+        }
+
+        let mut filter = Self::with_capacity(hashes.len(), bits_per_value);
+        for hash in hashes {
+            filter.insert_hash(hash);
         }
         Ok(Some(filter))
     }
@@ -326,6 +337,38 @@ mod tests {
             .is_none());
     }
 
+    /// View arrays hold the same text behind a different layout, so they must
+    /// hash to the same thing. DataFusion asks for view types by default, so
+    /// without this a string column would often have no filter at all.
+    #[test]
+    fn a_view_column_gets_a_filter_that_matches_its_plain_form() {
+        use arrow_array::{StringViewArray, BinaryViewArray};
+
+        let values = ["alpha", "bravo", "charlie"];
+        let plain = StringArray::from(values.to_vec());
+        let view = StringViewArray::from(values.to_vec());
+        assert!(supports(view.data_type()));
+
+        let plain_filter = filter_over(&plain);
+        let view_filter = filter_over(&view);
+        assert_eq!(
+            plain_filter, view_filter,
+            "the same text must give the same filter whatever the layout"
+        );
+
+        // And a probe of either type finds it.
+        let probe: ArrayRef = Arc::new(StringArray::from(vec!["bravo"]));
+        assert!(view_filter.may_contain(&probe, &DataType::Utf8View));
+        let absent: ArrayRef = Arc::new(StringArray::from(vec!["zulu"]));
+        assert!(!view_filter.may_contain(&absent, &DataType::Utf8View));
+
+        let blobs = BinaryViewArray::from(vec![&b"one"[..], b"two"]);
+        assert!(supports(blobs.data_type()));
+        assert!(BloomFilter::build(&blobs, DEFAULT_BITS_PER_VALUE)
+            .unwrap()
+            .is_some());
+    }
+
     #[test]
     fn a_type_with_no_canonical_encoding_gets_no_filter() {
         let values = Int32Array::from(vec![1, 2, 3]);
@@ -354,6 +397,29 @@ mod tests {
         assert!(BloomFilter::from_bytes(&[]).is_err());
         assert!(BloomFilter::from_bytes(&[0u8; 7]).is_err());
         assert!(BloomFilter::from_bytes(&[0u8; 32]).is_ok());
+    }
+
+    /// A column that repeats itself needs room for what it holds, not for how
+    /// often it holds it.
+    #[test]
+    fn a_filter_is_sized_by_distinct_values() {
+        let few: Vec<i64> = (0..10_000).map(|i| i % 8).collect();
+        let many: Vec<i64> = (0..10_000).collect();
+        let repeated = filter_over(&Int64Array::from(few));
+        let distinct = filter_over(&Int64Array::from(many));
+
+        assert!(
+            repeated.byte_len() * 50 < distinct.byte_len(),
+            "eight values should not need a filter sized for ten thousand: \
+             {} against {}",
+            repeated.byte_len(),
+            distinct.byte_len()
+        );
+        // And it still answers correctly.
+        for value in 0..8i64 {
+            let probe: ArrayRef = Arc::new(Int64Array::from(vec![value]));
+            assert!(repeated.may_contain(&probe, &DataType::Int64));
+        }
     }
 
     #[test]
