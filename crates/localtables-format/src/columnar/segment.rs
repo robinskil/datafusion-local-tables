@@ -23,7 +23,7 @@ use std::sync::Arc;
 use crate::columnar::bloom::BloomFilter;
 use crate::columnar::trigram;
 use crate::columnar::zonemap::ZoneMap;
-use crate::columnar::decode::{decode_column, BufferSource, SegmentBytes};
+use crate::columnar::decode::{decode_column, decode_column_rows, BufferSource, SegmentBytes};
 use crate::columnar::encode::{compress_buffers, encode_column, EncodedColumn};
 use crate::columnar::page::{
     ArchivedSegmentMeta, BufferRole, BufferSpec, Codec, ColumnChunk, SegmentMeta,
@@ -488,11 +488,42 @@ impl SegmentReader {
         decode_column(chunk, field.data_type(), &source)
     }
 
+    /// Decode a range of one column's rows.
+    pub fn column_rows(&self, index: usize, start: usize, len: usize) -> Result<ArrayRef> {
+        let meta = self.meta()?;
+        let field = self.schema.fields().get(index).ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "column {index} is out of range for a {}-column schema",
+                self.schema.fields().len()
+            ))
+        })?;
+        let Some(chunk) = meta.columns.get(index) else {
+            return Ok(absent_column(field, len));
+        };
+        let source = SegmentBytes::new(self.bytes.clone());
+        decode_column_rows(chunk, field.data_type(), &source, start, len)
+    }
+
     /// Decode the named columns into a batch.
     ///
     /// Columns outside `projection` are never touched: their bytes are not
     /// read, decompressed, or decoded.
     pub fn read(&self, projection: Option<&[usize]>) -> Result<RecordBatch> {
+        let rows = self.meta()?.row_count.to_native() as usize;
+        self.read_rows(projection, 0, rows)
+    }
+
+    /// Decode the named columns for a range of rows.
+    ///
+    /// Only these rows are expanded. For a column stored as a dictionary or as
+    /// runs, that is the difference between paying for the segment and paying
+    /// for the range.
+    pub fn read_rows(
+        &self,
+        projection: Option<&[usize]>,
+        start: usize,
+        len: usize,
+    ) -> Result<RecordBatch> {
         let indices: Vec<usize> = match projection {
             Some(indices) => indices.to_vec(),
             None => (0..self.schema.fields().len()).collect(),
@@ -521,9 +552,9 @@ impl SegmentReader {
                 let field = self.schema.field(i);
                 let Some(chunk) = meta.columns.get(i) else {
                     // Older than the column: no value, so null.
-                    return Ok(absent_column(field, meta.row_count.to_native() as usize));
+                    return Ok(absent_column(field, len));
                 };
-                decode_column(chunk, field.data_type(), &source)
+                decode_column_rows(chunk, field.data_type(), &source, start, len)
             })
             .collect::<Result<_>>()?;
 
@@ -531,8 +562,7 @@ impl SegmentReader {
         if columns.is_empty() {
             // A count-only scan projects nothing; the batch still has to carry
             // the row count.
-            let rows = meta.row_count.to_native() as usize;
-            let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(rows));
+            let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(len));
             return RecordBatch::try_new_with_options(projected, columns, &options)
                 .map_err(Error::from);
         }

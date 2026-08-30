@@ -1233,3 +1233,147 @@ async fn page_bounds_do_not_change_what_a_segment_returns() {
         "page bounds must not cost the zero-copy read path"
     );
 }
+
+/// Decoding a range must give exactly what decoding everything and slicing
+/// would. This is the property the page-skipping read path rests on, and it has
+/// to hold for every encoding, because each undoes something different.
+#[tokio::test]
+async fn decoding_a_range_matches_decoding_everything_and_slicing() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        // Plain: buffers handed back as they are.
+        Field::new("id", DataType::Int64, false),
+        // Dictionary: few distinct values, expanded on read.
+        Field::new("category", DataType::Utf8, true),
+        // Runs: long stretches of one value.
+        Field::new("flag", DataType::Int32, false),
+        // Variable width, so offsets have to be sliced correctly too.
+        Field::new("body", DataType::Utf8, true),
+    ]));
+
+    let rows = 1000i64;
+    let ids: Vec<i64> = (0..rows).collect();
+    let categories: Vec<String> = ids.iter().map(|i| format!("cat-{}", i % 4)).collect();
+    let flags: Vec<i32> = ids.iter().map(|i| (i / 100) as i32).collect();
+    let bodies: Vec<Option<String>> = ids
+        .iter()
+        .map(|i| (i % 7 != 0).then(|| format!("body-{i}")))
+        .collect();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(categories)),
+            Arc::new(Int32Array::from(flags)),
+            Arc::new(StringArray::from(bodies)),
+        ],
+    )
+    .unwrap();
+
+    // Encodings on, so the dictionary and run-length paths are the ones taken.
+    let opts = TableOptions {
+        dictionary_encoding: true,
+        rle_encoding: true,
+        ..options(Compression::None, false)
+    };
+    let (_dir, reader) = round_trip(&schema, std::slice::from_ref(&batch), &opts).await;
+
+    let whole = reader.read(None).unwrap();
+    assert_eq!(whole, batch);
+
+    for (start, len) in [
+        (0, 1),
+        (0, 1000),
+        (1, 1),
+        (250, 500),
+        (999, 1),
+        (500, 0),
+        (37, 313),
+    ] {
+        let range = reader.read_rows(None, start, len).unwrap();
+        assert_eq!(range.num_rows(), len, "rows {start}..{}", start + len);
+        for column in 0..schema.fields().len() {
+            let expected = whole.column(column).slice(start, len);
+            assert_eq!(
+                range.column(column),
+                &expected,
+                "column {} over rows {start}..{}",
+                schema.field(column).name(),
+                start + len
+            );
+            // And one column at a time takes the same path.
+            assert_eq!(
+                &reader.column_rows(column, start, len).unwrap(),
+                &expected,
+                "column_rows for {}",
+                schema.field(column).name()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_range_outside_the_segment_is_refused() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from((0..100).collect::<Vec<i32>>()))],
+    )
+    .unwrap();
+    let opts = options(Compression::None, false);
+    let (_dir, reader) = round_trip(&schema, &[batch], &opts).await;
+
+    assert!(reader.read_rows(None, 0, 101).is_err());
+    assert!(reader.read_rows(None, 100, 1).is_err());
+    assert!(reader.read_rows(None, 101, 0).is_err());
+    assert!(reader.read_rows(None, 100, 0).is_ok(), "the empty tail is a valid range");
+}
+
+/// A projection of nothing still has to carry the range's row count, or a
+/// count-only query over skipped pages would come out wrong.
+#[tokio::test]
+async fn a_count_only_read_of_a_range_carries_its_rows() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from((0..100).collect::<Vec<i32>>()))],
+    )
+    .unwrap();
+    let opts = options(Compression::None, false);
+    let (_dir, reader) = round_trip(&schema, &[batch], &opts).await;
+
+    let counted = reader.read_rows(Some(&[]), 10, 25).unwrap();
+    assert_eq!(counted.num_columns(), 0);
+    assert_eq!(counted.num_rows(), 25);
+}
+
+/// A compressed chunk is decompressed whole however small the range, because
+/// compression covers a buffer rather than a page. The answer must still be
+/// right; only the saving is absent.
+#[tokio::test]
+async fn a_range_of_a_compressed_chunk_is_still_correct() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from((0..1000i64).collect::<Vec<i64>>()))],
+    )
+    .unwrap();
+    let opts = options(Compression::Lz4, false);
+    let (_dir, reader) = round_trip(&schema, std::slice::from_ref(&batch), &opts).await;
+
+    let whole = reader.read(None).unwrap();
+    let range = reader.read_rows(None, 400, 200).unwrap();
+    assert_eq!(range.column(0), &whole.column(0).slice(400, 200));
+}

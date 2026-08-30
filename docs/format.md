@@ -233,11 +233,21 @@ needs bounds stored inside a segment that only a reader of that segment has. It
 therefore cannot show in `EXPLAIN`; `EXPLAIN ANALYZE` reports `pages_pruned`
 alongside the scan's output rows.
 
-**What this skips is handing a page upward, not decoding it.** A segment is
-decoded whole and then sliced, so a page nobody wants still costs whatever its
-columns cost to decode. On plain columns that is buffer wrapping and near
-nothing; on a dictionary column the whole segment is expanded first.
-`docs/performance.md` measures what that leaves on the table.
+A skipped page is not decoded. The stored array is still assembled whole,
+because assembling it is buffer wrapping and reads no bytes; on a mapped file
+the pages nobody asked for are never faulted in. What the range changes is the
+*expansion*: a chunk stored as a dictionary or as runs has to be turned back
+into the type the schema declares, and that is work proportional to the rows
+expanded. Slicing before the expansion rather than after is what makes a page
+worth skipping, and it is why page bounds are worth 2.65x on a table with
+encodings on and only 1.27x on plain columns.
+
+Neighbouring kept pages are joined into one range, so a scan that keeps most of
+a segment decodes it in a few passes rather than one per page.
+
+Compression is the exception: it covers a buffer rather than a page, so a
+compressed chunk is decompressed whole however small the range. Compressing per
+page would fix that and has not been done.
 
 ## Membership filters
 

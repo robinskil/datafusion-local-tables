@@ -94,18 +94,58 @@ pub fn decode_column(
     data_type: &DataType,
     source: &dyn BufferSource,
 ) -> Result<ArrayRef> {
+    let rows = chunk.len.to_native() as usize;
+    decode_column_rows(chunk, data_type, source, 0, rows)
+}
+
+/// Decode a range of a column's rows.
+///
+/// The stored array is always assembled whole, because assembling it is buffer
+/// wrapping and costs nothing: no byte of a range nobody asked for is read, and
+/// on a mapped file those pages are never faulted in.
+///
+/// What the range does change is the expansion. A dictionary or run-length
+/// chunk has to be turned back into the type the schema declares, and that is
+/// work proportional to the rows expanded. Slicing before the expansion rather
+/// than after is the difference between paying for the segment and paying for
+/// the rows.
+pub fn decode_column_rows(
+    chunk: &ArchivedColumnChunk,
+    data_type: &DataType,
+    source: &dyn BufferSource,
+    start: usize,
+    len: usize,
+) -> Result<ArrayRef> {
+    let stored_rows = chunk.len.to_native() as usize;
+    if start > stored_rows || start + len > stored_rows {
+        return Err(Error::InvalidArgument(format!(
+            "rows {start}..{} are outside a {stored_rows}-row chunk",
+            start + len
+        )));
+    }
+    let whole = start == 0 && len == stored_rows;
+
     match chunk.encoding.to_native() {
-        // Stored as the column's own type. Nothing to undo.
-        Encoding::Plain => Ok(make_array(rebuild(chunk, data_type, source)?)),
+        // Stored as the column's own type. Nothing to undo, and a slice of it
+        // shares the same buffers.
+        Encoding::Plain => {
+            let array = make_array(rebuild(chunk, data_type, source)?);
+            Ok(if whole { array } else { array.slice(start, len) })
+        }
 
         // Stored as a dictionary over the column's type, then cast back. The
         // cast is the price of the smaller file; a column declared as a
         // dictionary in the schema takes the Plain path instead and pays
         // nothing.
+        //
+        // Slicing first costs nothing — a dictionary array slices its keys and
+        // keeps its values — and leaves the cast expanding `len` rows instead
+        // of the whole chunk.
         Encoding::Dictionary => {
             let stored =
                 DataType::Dictionary(Box::new(DataType::Int32), Box::new(data_type.clone()));
             let array = make_array(rebuild(chunk, &stored, source)?);
+            let array = if whole { array } else { array.slice(start, len) };
             arrow_cast::cast(&array, data_type)
                 .map_err(|e| Error::corrupt(format!("a dictionary chunk failed to expand: {e}")))
         }
@@ -114,6 +154,7 @@ pub fn decode_column(
             let (run_ends, values) = run_end_fields(data_type);
             let stored = DataType::RunEndEncoded(run_ends, values);
             let array = make_array(rebuild(chunk, &stored, source)?);
+            let array = if whole { array } else { array.slice(start, len) };
             arrow_cast::cast(&array, data_type)
                 .map_err(|e| Error::corrupt(format!("a run-length chunk failed to expand: {e}")))
         }

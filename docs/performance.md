@@ -219,41 +219,42 @@ not measured either.
 
 ## Page bounds inside a segment
 
-Bounds recorded for each row range inside a segment let a scan hand the filter
-above it one page rather than the whole segment. Measured on 500,000 rows in a
-single segment, so a segment zone map rules nothing out and page bounds are the
-only thing left to prune with:
+Bounds recorded for each row range inside a segment let a scan decode and hand
+on one page rather than the whole segment. Measured on 500,000 rows in a single
+segment, so a segment zone map rules nothing out and page bounds are the only
+thing left to prune with. All six built in one run:
 
 | variant | `WHERE id = 372145` |
 | --- | --- |
-| local, encodings on, no page bounds | 5.87 ms |
-| local, encodings on, page bounds | 6.04 ms |
-| local, plain columns, no page bounds | 4.18 ms |
-| local, plain columns, page bounds | 3.75 ms |
-| parquet | 6.20 ms |
-| parquet, page index | **0.96 ms** |
+| local, encodings on, no page bounds | 3.92 ms |
+| local, encodings on, page bounds | **1.48 ms** |
+| local, plain columns, no page bounds | 2.58 ms |
+| local, plain columns, page bounds | 2.04 ms |
+| parquet | 2.86 ms |
+| parquet, page index | 0.61 ms |
 
-**Page bounds do what they claim and it does not show on the clock.** The tests
-in `sql_pages.rs` measure the scan's own output and it falls from 10,000 rows to
-500, a twentyfold cut in what the filter above receives. The wall clock barely
-moves: about a tenth on plain columns, and nothing distinguishable from noise
-with dictionary encoding on.
+**Page bounds are worth 2.65x on a table with encodings on.** They are worth
+much less on plain columns, 1.27x, and the difference between those two rows is
+the whole mechanism: what a page skips is the work of *expanding* it. A plain
+column is buffer wrapping and costs almost nothing to skip; a dictionary column
+has to be turned back into the type the schema declares, and that is work
+proportional to the rows expanded.
 
-The reason is in those last two rows, and it is worth stating plainly.
-**Skipping a page here means not handing it upward, not avoiding the work of
-decoding it.** A segment is decoded whole and then sliced. For a plain column
-that decode is buffer wrapping and costs almost nothing, which is why a little
-shows through; for a dictionary column the whole segment is expanded first, and
-skipping pages afterwards saves none of it. Parquet's page index skips the
-decode itself, which is the entire 6.5x it gains here.
+That only became true when the decoder learned to build a range. Before it did,
+a segment was decoded whole and then sliced, and these same bounds bought
+nothing at all: 6.04 ms against 5.87 ms unpruned, in a run of their own. Slicing
+a dictionary array before the expansion rather than after is the entire
+difference, and it is four lines.
 
-So the work this leaves is not more statistics. It is teaching the decoder to
-build only the rows a caller asked for, at which point these bounds become worth
-what parquet's are.
+Parquet's page index is still ahead, 0.61 against 1.48 ms. The gap was 6.5x
+before the decoder changed and is 2.4x now.
 
-An earlier run of this benchmark showed page bounds ahead by 14% on encoded
-columns. That was noise: the unpruned measurement ranged from 6.18 to 6.84 ms.
-The figures above are from one run where every variant was built together.
+**These numbers cannot be compared with the ones in the paragraph above them.**
+The machine drifts tens of percent between runs: parquet measured 6.20 ms in the
+run that produced the old figures and 2.86 ms in this one, on an identical file.
+Only the rows inside one table are comparable with each other. An earlier
+version of this section reported page bounds ahead by 14% on encoded columns
+before the decoder changed; that was noise across exactly this kind of gap.
 
 ## Parallel scans
 

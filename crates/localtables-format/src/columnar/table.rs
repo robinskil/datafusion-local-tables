@@ -678,36 +678,27 @@ impl ColumnarTable {
         keep_pages: Option<&[bool]>,
     ) -> Result<Vec<RecordBatch>> {
         let reader = self.segment_reader_as(entry, schema).await?;
-        let full = reader.read(projection)?;
+        let rows = reader.row_count()? as usize;
 
         // The mask covers the segment's own row positions, so it has to be
-        // applied to a page before the page is compacted; filtering first would
-        // shift every row and leave the page boundaries meaning nothing.
+        // applied to a range before that range is compacted; filtering first
+        // would shift every row and leave the page boundaries meaning nothing.
         let mask = match snapshot.deletes_for(entry.segment_id) {
             None => None,
             Some(dv) if dv.is_empty() => None,
-            Some(dv) => Some(dv.keep_mask(full.num_rows())),
+            Some(dv) => Some(dv.keep_mask(rows)),
         };
 
         let ranges = match keep_pages {
-            None => vec![(0, full.num_rows())],
-            Some(keep) => {
-                let mut ranges = Vec::new();
-                for (page, wanted) in keep.iter().enumerate() {
-                    if !wanted {
-                        continue;
-                    }
-                    if let Some(range) = reader.page_range(page)? {
-                        ranges.push(range);
-                    }
-                }
-                ranges
-            }
+            None => vec![(0, rows)],
+            Some(keep) => kept_ranges(&reader, keep)?,
         };
 
         let mut out = Vec::new();
         for (start, len) in ranges {
-            let page = full.slice(start, len);
+            // Decoded a range at a time, so a column stored as a dictionary or
+            // as runs is expanded only for the rows being handed on.
+            let page = reader.read_rows(projection, start, len)?;
             let page = match &mask {
                 None => page,
                 Some(mask) => {
@@ -1359,6 +1350,28 @@ fn build_snapshot(writer: &Writer) -> Result<Arc<Snapshot>> {
         deletes: writer.delete_list(),
         memtable: Arc::new(writer.memtable.batches(None)?),
     }))
+}
+
+/// The row ranges a page selection asks for, with neighbours joined.
+///
+/// Pages that sit next to each other become one range. A scan that keeps most
+/// of a segment then decodes it in a few passes rather than one per page, and
+/// a scan that keeps all of it decodes it in one.
+fn kept_ranges(reader: &SegmentReader, keep: &[bool]) -> Result<Vec<(usize, usize)>> {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for (page, wanted) in keep.iter().enumerate() {
+        if !wanted {
+            continue;
+        }
+        let Some((start, len)) = reader.page_range(page)? else {
+            continue;
+        };
+        match ranges.last_mut() {
+            Some((at, taken)) if *at + *taken == start => *taken += len,
+            _ => ranges.push((start, len)),
+        }
+    }
+    Ok(ranges)
 }
 
 /// Group batches into row groups of at most `max_rows` rows each.
