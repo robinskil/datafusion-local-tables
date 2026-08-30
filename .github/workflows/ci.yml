@@ -36,6 +36,22 @@ jobs:
       - run: uname -r
       - run: cargo test -p localtables-format --all-features io::uring -- --nocapture
 
+  # A short run per target on every change. This is a smoke test, not a
+  # campaign: it catches a panic a change introduces, and finds little else.
+  # A real hunt needs hours and a corpus that persists between runs.
+  fuzz:
+    name: fuzz (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --locked
+      - run: |
+          for target in frame segment_meta segment_read wal_record batch_decode; do
+            cargo fuzz run "$target" -- -max_total_time=60 -rss_limit_mb=4096
+          done
+
   lint:
     name: fmt and clippy
     runs-on: ubuntu-latest

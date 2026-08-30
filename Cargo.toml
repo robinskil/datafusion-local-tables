@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/localtables-format", "crates/datafusion-local-tables"]
+# The fuzz crate needs nightly and libFuzzer, so it stays out of the workspace.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

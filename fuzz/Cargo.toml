@@ -1,0 +1,51 @@
+[package]
+name = "localtables-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+localtables-format = { path = "../crates/localtables-format", features = ["lz4", "zstd", "mmap"] }
+arrow-array = "59"
+arrow-schema = "59"
+rkyv = { version = "0.8", features = ["bytecheck"] }
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segment_meta"
+path = "fuzz_targets/segment_meta.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segment_read"
+path = "fuzz_targets/segment_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_record"
+path = "fuzz_targets/wal_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "batch_decode"
+path = "fuzz_targets/batch_decode.rs"
+test = false
+doc = false
+bench = false

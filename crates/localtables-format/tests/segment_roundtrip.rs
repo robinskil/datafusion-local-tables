@@ -1542,3 +1542,29 @@ async fn a_block_size_of_zero_leaves_every_column_whole() {
     assert_eq!(reader.block_rows().unwrap(), 0);
     assert_eq!(reader.read(None).unwrap(), batch);
 }
+
+/// A metadata extent that points past the bytes on hand is refused.
+///
+/// Found by `cargo fuzz run segment_meta`. The extent comes off disk, so it can
+/// say anything. Before the check it sliced with it and panicked.
+#[test]
+fn a_metadata_extent_past_the_end_is_refused() {
+    use localtables_format::columnar::segment::read_meta;
+
+    let bytes = [0xd9u8, 0x00, 0xd9, 0x0a];
+
+    // The exact input the fuzzer found: four bytes, an extent claiming 55,552.
+    let err = read_meta(&bytes, Extent::new(0, 55_552)).unwrap_err();
+    assert!(
+        matches!(err, localtables_format::Error::Corrupt(_)),
+        "got {err:?}"
+    );
+
+    // An offset past the end, and a length that would overflow if added.
+    assert!(read_meta(&bytes, Extent::new(9, 1)).is_err());
+    assert!(read_meta(&bytes, Extent::new(u64::MAX, 8)).is_err());
+    assert!(read_meta(&bytes, Extent::new(0, u64::MAX)).is_err());
+
+    // A zero-length extent is in range and simply holds no frame.
+    assert!(read_meta(&bytes, Extent::new(0, 0)).is_err());
+}

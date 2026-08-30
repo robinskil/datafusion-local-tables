@@ -744,8 +744,23 @@ impl std::fmt::Debug for SegmentReader {
 }
 
 /// Read the metadata of a segment held in memory, for tests and diagnostics.
+///
+/// The extent comes off disk, so it may point anywhere. It is checked against
+/// the bytes on hand before it is used.
 pub fn read_meta(bytes: &[u8], meta_extent: Extent) -> Result<SegmentMeta> {
-    let frame = &bytes[meta_extent.range()];
+    let start = meta_extent.offset as usize;
+    let end = start
+        .checked_add(meta_extent.len as usize)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| {
+            Error::corrupt(format!(
+                "segment metadata at {}..{} runs past the {}-byte segment",
+                meta_extent.offset,
+                meta_extent.offset.saturating_add(meta_extent.len),
+                bytes.len()
+            ))
+        })?;
+    let frame = &bytes[start..end];
     let payload = frame::decode(frame, tag::SEGMENT, "segment metadata")?;
     let archived = rkyv::access::<ArchivedSegmentMeta, rkyv::rancor::Error>(payload)?;
     rkyv::deserialize::<_, rkyv::rancor::Error>(archived).map_err(Error::from)

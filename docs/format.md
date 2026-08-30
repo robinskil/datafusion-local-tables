@@ -568,6 +568,38 @@ appends followed by a sync.
 Asking for a backend this build cannot provide is an error, never a silent
 downgrade to another one.
 
+## Fuzzing
+
+Everything the format reads off disk may be damaged. The readers are fuzzed
+against that, in `fuzz/`:
+
+| target | what it feeds |
+| --- | --- |
+| `frame` | any bytes to the frame decoder, under every tag |
+| `segment_meta` | any bytes as a segment's metadata, at any extent |
+| `segment_read` | any bytes as a whole segment, then decodes its columns |
+| `wal_record` | any bytes as a log record |
+| `batch_decode` | any bytes as a logged batch, then rebuilds its arrays |
+
+The property is the same for all five. Any input gives a value or an error. None
+gives a panic.
+
+```bash
+cargo +nightly fuzz run segment_meta
+```
+
+`segment_read` and `batch_decode` matter most. They go past validation and let
+Arrow build arrays over byte ranges the file chose, which is where a damaged
+file could otherwise reach memory it does not own.
+
+One panic has been found this way: `read_meta` sliced with an extent from the
+file without a bounds check. `segment_roundtrip.rs` holds the input as a
+regression test, so the bug stays fixed without a nightly toolchain.
+
+CI runs one minute per target on every change. That is a smoke test. It catches
+a panic a change introduces. A real hunt needs hours and a corpus that lives
+between runs.
+
 ## Locking
 
 The writer takes an exclusive advisory lock on the data file; read-only handles

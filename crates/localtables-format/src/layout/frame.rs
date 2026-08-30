@@ -31,7 +31,6 @@ pub mod tag {
     pub const SCHEMA: u64 = u64::from_le_bytes(*b"LTSCHEMA");
     pub const WAL_FILE: u64 = u64::from_le_bytes(*b"LTWALHDR");
     pub const WAL_REC: u64 = u64::from_le_bytes(*b"LTWALREC");
-    pub const BTREE_NODE: u64 = u64::from_le_bytes(*b"LTBTNODE");
 }
 
 /// Wrap `payload` in a frame. Returns the full frame bytes.
