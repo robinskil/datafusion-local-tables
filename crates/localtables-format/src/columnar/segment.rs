@@ -91,7 +91,6 @@ pub fn build_segment(
     let mut chunks = Vec::with_capacity(columns.len());
 
     for (index, array) in columns.iter().enumerate() {
-        let encoded = encode_column(array.as_ref(), options)?;
         // Chosen per column, because whether a codec pays depends on what the
         // column holds: text compresses several times over, scattered numbers
         // not at all, and a codec that gains nothing still costs the column its
@@ -99,6 +98,16 @@ pub fn build_segment(
         let codec = options
             .compression
             .codec_for(schema.field(index).data_type());
+
+        // A column that will be cut into blocks is encoded block by block, so
+        // encoding it whole as well would be work thrown away: the outer chunk
+        // keeps no buffers. Only what describes the column as a whole is built.
+        let encoded = if blocks_wanted(array.as_ref(), codec, options) {
+            EncodedColumn::describing(array.as_ref())
+        } else {
+            encode_column(array.as_ref(), options)?
+        };
+
         // Built here rather than inside the encoder, because whether a column
         // gets a filter is a question about its name, not about its values.
         let name = schema.field(index).name();
@@ -113,7 +122,7 @@ pub fn build_segment(
             trigram::build(
                 array.as_ref(),
                 options.bloom_bits_per_value,
-                encoded.byte_len(),
+                array.get_array_memory_size(),
             )?
         } else {
             None
@@ -229,6 +238,15 @@ fn concat_columns(
 }
 
 /// Append one encoded column to the segment, padding each buffer.
+/// Whether this column will be stored in blocks.
+///
+/// Asked before the column is encoded as well as while it is written, because
+/// the answer decides whether encoding it whole is worth doing at all.
+fn blocks_wanted(array: &dyn Array, codec: Codec, options: &TableOptions) -> bool {
+    let block_rows = options.compression_block_rows;
+    block_rows > 0 && array.len() > block_rows && worth_blocking(codec, array.data_type())
+}
+
 /// True when cutting a column into blocks pays for itself.
 ///
 /// A compressed column always gains: a block is the unit a reader can
@@ -275,11 +293,11 @@ fn write_blocked_chunk(
     trigram: Option<&BloomFilter>,
     pages: Option<&[ZoneMap]>,
 ) -> Result<ColumnChunk> {
-    let block_rows = options.compression_block_rows;
-    let rows = array.len();
-    if block_rows == 0 || rows <= block_rows || !worth_blocking(codec, array.data_type()) {
+    if !blocks_wanted(array, codec, options) {
         return write_chunk(bytes, encoded, codec, bloom, trigram, pages);
     }
+    let block_rows = options.compression_block_rows;
+    let rows = array.len();
 
     let mut blocks = Vec::with_capacity(rows.div_ceil(block_rows));
     let mut start = 0;

@@ -38,6 +38,25 @@ pub struct EncodedColumn {
 }
 
 impl EncodedColumn {
+    /// What describes a column as a whole, without encoding any of it.
+    ///
+    /// For a column stored in blocks: the blocks carry the data, and the chunk
+    /// above them carries only the counts and the bounds. Encoding it whole as
+    /// well would build buffers nobody keeps.
+    pub fn describing(array: &dyn Array) -> Self {
+        Self {
+            encoding: Encoding::Plain,
+            len: array.len() as u64,
+            null_count: array.null_count() as u64,
+            dict_len: 0,
+            run_count: 0,
+            offset: 0,
+            zone: ZoneMap::build(array),
+            buffers: Vec::new(),
+            children: Vec::new(),
+        }
+    }
+
     /// Bytes this column contributes to the segment, before compression.
     pub fn byte_len(&self) -> usize {
         self.buffers.iter().map(|(_, b)| b.len()).sum::<usize>()

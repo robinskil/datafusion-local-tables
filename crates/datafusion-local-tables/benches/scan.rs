@@ -676,6 +676,99 @@ fn scattered_point_lookup(c: &mut Criterion) {
 
 
 
+
+/// What compression and blocking cost to *write*.
+///
+/// `build_segment` is the whole encode path with no file in it: choose an
+/// encoding per column, build the zone maps and page bounds, compress, and lay
+/// the bytes out. Everything a flush does before it touches the disk.
+///
+/// Bytes written are reported alongside, because a codec that costs processor
+/// time also hands the disk less to do.
+fn write_cost(c: &mut Criterion) {
+    use localtables_format::columnar::segment::build_segment;
+    use localtables_format::layout::schema::SchemaLayout;
+
+    let text_schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("body", DataType::Utf8, false),
+    ]));
+    let numeric_schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Float64, false),
+    ]));
+
+    let text = RecordBatch::try_new(
+        text_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from((0..ROWS).collect::<Vec<i64>>())),
+            Arc::new(StringArray::from(
+                (0..ROWS)
+                    .map(|i| format!("user{i}.{}@mail-{}.example.com", i * 7 % 100_000, i % 32))
+                    .collect::<Vec<String>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    let numeric = RecordBatch::try_new(
+        numeric_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from((0..ROWS).collect::<Vec<i64>>())),
+            Arc::new(Float64Array::from(
+                (0..ROWS).map(|i| i as f64 * 1.5).collect::<Vec<f64>>(),
+            )),
+        ],
+    )
+    .unwrap();
+
+    let settings: Vec<(&str, Compression, usize)> = vec![
+        ("raw, unblocked", Compression::None, 0),
+        ("raw, blocked", Compression::None, 8192),
+        ("lz4, blocked", Compression::Lz4, 8192),
+        ("lz4, unblocked", Compression::Lz4, 0),
+        ("zstd, blocked", Compression::Zstd, 8192),
+        ("zstd, unblocked", Compression::Zstd, 0),
+        ("zstd, 512-row blocks", Compression::Zstd, 512),
+    ];
+
+    for (label, schema, batch) in [
+        ("text", &text_schema, &text),
+        ("numbers", &numeric_schema, &numeric),
+    ] {
+        let layout = SchemaLayout::of(schema);
+        let mut group = c.benchmark_group(format!("write: {label}"));
+        group.throughput(Throughput::Elements(ROWS as u64));
+        for (name, compression, block_rows) in &settings {
+            let options = TableOptions {
+                durability: Durability::None,
+                compression: *compression,
+                compression_block_rows: *block_rows,
+                ..TableOptions::default()
+            };
+            // Report what a flush would hand the disk, so the processor cost
+            // and the bytes it saves can be read together.
+            let built =
+                build_segment(0, schema, layout.current(), std::slice::from_ref(batch), &options)
+                    .unwrap();
+            println!("write {label:>8} {name:<22} {:>6} KiB", built.bytes.len() / 1024);
+
+            group.bench_function(*name, |b| {
+                b.iter(|| {
+                    build_segment(
+                        0,
+                        schema,
+                        layout.current(),
+                        std::slice::from_ref(batch),
+                        &options,
+                    )
+                    .unwrap()
+                })
+            });
+        }
+        group.finish();
+    }
+}
+
 /// What a smaller compression block buys, and what it costs, on a table whose
 /// bulk is text that does not dictionary encode.
 ///
@@ -1190,6 +1283,7 @@ criterion_group!(
     page_pruning,
     compression_choice,
     page_size_tradeoff,
+    write_cost,
     substring_search,
     clustered_layout,
     small_writes
