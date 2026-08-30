@@ -318,6 +318,49 @@ and no processor time, so pruning can be finer than decompression; the defaults
 happen to match, so a page a predicate rules out also costs nothing to
 decompress.
 
+### Compression dictionaries, and why there are none
+
+A dictionary is the usual answer to small blocks compressing badly: give the
+codec content it can reference as though it were prior history. It was measured
+and it does not work here.
+
+500,000 distinct email-shaped strings, 16 MiB, against compressing the column as
+one block:
+
+| block | zstd alone | + content dict | + trained dict | lz4 alone | + content dict |
+| --- | --- | --- | --- | --- | --- |
+| 4 KiB | +89.5% | +112.0% | +156.1% | +8.6% | +4.7% |
+| 17 KiB | +72.9% | +93.9% | +96.9% | +1.6% | −1.3% |
+| 70 KiB | +74.5% | +86.2% | +78.4% | +1.5% | +0.5% |
+| 280 KiB | +56.5% | +61.4% | +54.8% | +0.4% | +0.1% |
+
+**A dictionary makes zstd worse at every block size tried**, and the trained one
+is worse than the raw content one at the sizes where it matters. It reaches
+break-even only at 280 KiB blocks, where blocking costs least and a dictionary
+is needed least.
+
+For lz4 a content dictionary does help, and the help is worth 0.3% at the block
+size this format uses, while costing 30% on decompression: 49.6 us per block
+becomes 64.6 us. That is not a trade worth any machinery.
+
+An earlier note in this file said a trained dictionary got within 4.6% of
+whole-column compression. That was measured on a fixture whose text cycled
+through eight values, which a trained dictionary captures almost perfectly and
+real text does not. The table above is the corrected figure and the synthetic
+one should not be relied on.
+
+The reason is that a dictionary earns its place when a block has no history of
+its own to reference. Blocks here are sized in rows, so even 512 rows of text is
+17 KiB and already carries plenty. Dictionaries belong to formats whose blocks
+are single-digit kilobytes.
+
+One thing the table does say: **zstd loses far more to blocking on real text
+than the benchmark fixture suggests.** That fixture's only string column is low
+cardinality and dictionary encoded, so its values buffer is tiny; blocking cost
+it 5.7%. A column of genuinely distinct text costs 56.5% at the default block
+size. A table with text columns that wants zstd should raise
+`compression_block_rows`, and give up some of the skipping to get it back.
+
 ## Parallel scans
 
 A segment is the unit a scan gives to a partition. Partitions take segments from

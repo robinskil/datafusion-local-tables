@@ -272,6 +272,10 @@ no processor time, so pruning can be finer than decompression. The defaults
 match, so a page a predicate rules out also costs nothing to decompress, but
 either can move without the other.
 
+No compression dictionary is used. One was measured and it makes zstd worse at
+every block size tried, because a block sized in rows already carries plenty of
+its own history to reference; `docs/performance.md` has the figures.
+
 What blocking costs in size depends on how far the codec looks back. lz4 looks
 64 KiB whatever it is given, so cutting costs it about a quarter of a percent.
 zstd looks much further: the same data is 5.7% larger in blocks, and 177% larger
