@@ -1,16 +1,20 @@
 //! One canonical byte form per Arrow value.
 //!
-//! Membership filters hash values, and a value has to hash the same whether it
-//! arrived as a row of a column or as a literal inside a predicate. That is
-//! what this provides: one value, one byte string, whatever route it took.
+//! Membership filters hash values. A value must hash the same whether it came
+//! from a row of a column or from a literal in a predicate. This module gives
+//! that: one value, one byte string, whatever route it took.
 //!
-//! The encoding also orders: the bytes compare with `memcmp` the way the values
-//! compare. That takes work per type — signed integers need their sign bit
-//! flipped, floats need their sign and magnitude rearranged, strings need an
-//! escape so a shorter string never looks larger than one it prefixes — and
-//! nothing depends on it today. It is kept because it is what makes the
-//! encoding canonical in the first place: an order-preserving encoding cannot
-//! give one value two spellings, which is exactly the property a filter needs.
+//! The encoding also orders. The bytes compare with `memcmp` the way the values
+//! compare. That takes work per type:
+//!
+//! * a signed integer needs its sign bit flipped;
+//! * a float needs its sign and magnitude rearranged;
+//! * a string needs an escape, so a short string never looks larger than one it
+//!   prefixes.
+//!
+//! Nothing depends on that order today. It stays because it is what makes the
+//! encoding canonical. An order-preserving encoding cannot give one value two
+//! spellings, and that is the property a filter needs.
 //!
 //! Every encoding here is reversible.
 
@@ -134,12 +138,12 @@ fn encode_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 
 /// Map a float onto an unsigned integer that compares the same way.
 ///
-/// Positive floats already compare correctly as big-endian bits once the sign
-/// bit is set; negative ones compare backwards, so every bit is flipped.
+/// A positive float compares correctly as big-endian bits once the sign bit is
+/// set. A negative float compares backwards, so this flips every bit.
 ///
-/// Negative zero is normalised to positive zero first. The two are equal as
-/// numbers but differ in their bits, and a key that told them apart would let a
-/// lookup for `0.0` miss a row stored as `-0.0`.
+/// Negative zero becomes positive zero first. The two are equal as numbers and
+/// differ in their bits. A key that told them apart would let a lookup for
+/// `0.0` miss a row stored as `-0.0`.
 fn order_preserving_f32(value: f32) -> u32 {
     let bits = if value == 0.0 { 0f32 } else { value }.to_bits();
     if bits & 0x8000_0000 != 0 {

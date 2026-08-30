@@ -9,8 +9,8 @@ impl ColumnarTable {
 
     /// Append rows.
     ///
-    /// The rows are durable when this returns, and visible to the next scan,
-    /// but they are in the log and the memtable rather than in a segment.
+    /// The rows are durable when this returns, and the next scan sees them.
+    /// They sit in the log and the memtable, not yet in a segment.
     pub async fn insert(&self, batches: &[RecordBatch]) -> Result<u64> {
         let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
         if rows == 0 {
@@ -250,13 +250,12 @@ impl ColumnarTable {
         let min_active = self.inner.registry.min_active_txn();
 
         // One segment per row group, not one per flush. A segment is the unit a
-        // scan hands to a partition and the unit a zone map covers, so a flush
-        // that made one enormous segment would leave a reader nothing to divide
-        // and nothing to prune.
+        // scan gives a partition, and the unit a zone map covers. One enormous
+        // segment would leave a reader nothing to divide and nothing to prune.
         //
-        // The size is chosen from what the table will hold once this flush
-        // lands, so a small table gets small groups it can still divide and a
-        // large one gets groups near the cap rather than thousands of tiny ones.
+        // The size comes from what the table holds once this flush lands. A
+        // small table gets small groups it can still divide. A large table gets
+        // groups near the cap, not thousands of tiny ones.
         let total_rows = manifest.total_rows() + frozen.rows;
         let group_rows = self.inner.options.row_group_size_for(total_rows);
         let current = self.table_schema();

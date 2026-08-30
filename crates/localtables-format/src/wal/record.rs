@@ -1,8 +1,8 @@
 //! What a write-ahead log record holds.
 //!
 //! Three shapes, one per kind of write. An update is one record, not a delete
-//! followed by an insert, because a crash between two records must never leave
-//! the rows gone and their replacements missing.
+//! and then an insert. A crash between two records must never leave the old
+//! rows gone and their replacements missing.
 
 use rkyv::{Archive, Deserialize, Serialize};
 

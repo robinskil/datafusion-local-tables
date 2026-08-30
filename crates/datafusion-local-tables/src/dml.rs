@@ -1,13 +1,14 @@
 //! Writing to a local table through SQL.
 //!
-//! `INSERT` streams its input into the table's write-ahead log. `DELETE` and
-//! `UPDATE` first work out which rows match, then apply the change as one
-//! durable record, so a crash can never leave a delete half done or an update
-//! with its rows gone and their replacements missing.
+//! `INSERT` streams its input into the table's write-ahead log.
 //!
-//! Finding the matching rows means reading them. There is no secondary index,
-//! so a `DELETE` with a predicate scans the segments the zone maps cannot rule
-//! out, exactly as the equivalent `SELECT` would.
+//! `DELETE` and `UPDATE` first find which rows match. They then apply the
+//! change as one durable record. A crash can never leave a delete half done. It
+//! can never leave an update with its rows gone and their replacements missing.
+//!
+//! To find the matching rows is to read them. The table has no secondary index.
+//! A `DELETE` with a predicate scans the segments the zone maps cannot rule
+//! out, as the same `SELECT` would.
 
 use std::any::Any;
 use std::fmt;

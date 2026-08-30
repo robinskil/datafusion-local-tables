@@ -28,15 +28,14 @@ impl ColumnarTable {
 
     /// Rewrite every segment with the options this handle holds.
     ///
-    /// Filters, clustering and encodings are all decided when a segment is
-    /// written, so a table gains or loses them by being rewritten and not by
-    /// being reopened. Open the table with the options you want, then call
-    /// this: it is how a table acquires a membership filter, a trigram filter
-    /// or a z-order it was not created with, and how it sheds one.
+    /// A segment fixes its filters, its order and its encodings when the writer
+    /// writes it. A table gains or loses them by a rewrite, never by a reopen.
     ///
-    /// Returns the rows rewritten. This reads every live row into memory, the
-    /// same way compaction does, so it is a maintenance operation rather than
-    /// something to run under load.
+    /// Open the table with the options you want, then call this. It is how a
+    /// table takes on a membership filter, a trigram filter or a z-order it was
+    /// not created with. It is also how a table sheds one.
+    ///
+    /// Returns the rows rewritten. Run this as maintenance, not under load.
     pub async fn rewrite_all(&self) -> Result<u64> {
         let segment_ids: Vec<SegmentId> = self
             .snapshot()

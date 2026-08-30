@@ -62,10 +62,10 @@ pub fn encode(batch: &RecordBatch) -> BatchData {
 }
 
 fn encode_array(array: &ArrayRef) -> ColumnData {
-    // A sliced array keeps its parent's buffers and an offset into them.
-    // Compacting first means the record holds this array's rows starting at
-    // index zero, so the decoder needs no offset, and a small slice of a large
-    // batch does not log the whole parent.
+    // A sliced array keeps its parent's buffers and an offset into them. A
+    // compaction first makes the record hold this array's rows from index zero.
+    // The decoder then needs no offset, and a small slice of a large batch does
+    // not log the whole parent.
     let compacted;
     let array = if array.offset() == 0 {
         array
@@ -209,9 +209,9 @@ fn build_data(
 
 /// Copy an array into fresh buffers holding only its own rows.
 ///
-/// `concat` of a single array short-circuits to a slice, which is exactly what
-/// needs undoing here, so an empty array of the same type goes in front to take
-/// the general path. It works for every Arrow type, including nested ones.
+/// `concat` of one array short-circuits to a slice, which is the very thing
+/// this must undo. An empty array of the same type goes in front, to force the
+/// general path. This works for every Arrow type, nested ones included.
 fn compact(array: &ArrayRef) -> ArrayRef {
     let empty = arrow_array::new_empty_array(array.data_type());
     arrow_select::concat::concat(&[empty.as_ref(), array.as_ref()])

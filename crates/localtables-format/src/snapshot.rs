@@ -1,13 +1,15 @@
 //! Snapshots, and the rule that keeps their bytes alive.
 //!
-//! A reader pins a snapshot for the length of a query and sees the table
-//! exactly as it stood at one commit. Because a scan hands Arrow buffers that
-//! point straight into the mapped file, a snapshot is not just a list of
-//! segments: it is a claim on the bytes those segments occupy.
+//! A reader pins a snapshot for the length of a query. It sees the table
+//! exactly as it stood at one commit.
 //!
-//! So a freed extent cannot be handed out again the moment it is freed. The
-//! registry tracks which commits readers are still pinned to, and the allocator
-//! only reuses an extent once every reader that could be looking at it is gone.
+//! A scan gives out Arrow buffers that point straight into the mapped file. So
+//! a snapshot is more than a list of segments. It is a claim on the bytes those
+//! segments occupy.
+//!
+//! A freed extent therefore cannot go out again at once. The registry tracks
+//! which commits readers still hold. The allocator reuses an extent only after
+//! every reader that could read it is gone.
 
 use std::sync::{Arc, Weak};
 
@@ -28,11 +30,14 @@ pub struct Snapshot {
     pub txn_id: u64,
     pub schema: SchemaRef,
     pub manifest: Arc<Manifest>,
-    /// Deleted rows per segment. Held in memory rather than read back per
-    /// snapshot, and more up to date than the counts in the manifest, because
-    /// a delete is durable in the log well before a flush records it in a
-    /// commit. Segments with nothing deleted are absent, so the common case
-    /// costs no lookup.
+    /// Deleted rows per segment.
+    ///
+    /// These stay in memory, rather than come back from disk per snapshot. They
+    /// are also fresher than the counts in the manifest: a delete is durable in
+    /// the log well before a flush records it in a commit.
+    ///
+    /// A segment with nothing deleted is absent, so the common case needs no
+    /// lookup.
     pub deletes: Vec<(SegmentId, Arc<DeleteVector>)>,
     /// Rows durable in the write-ahead log but not yet written to a segment.
     /// A scan reads these alongside the segments, so a row is visible as soon

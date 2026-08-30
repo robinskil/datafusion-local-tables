@@ -4,11 +4,12 @@
 //! instead, waits for one sync, and lands in the memtable. A flush later turns
 //! the accumulated rows into one segment and empties the log.
 //!
-//! Tables keep two log files and swap between them. A flush freezes the
-//! memtable and switches appends to the other file, so it can truncate the log
-//! it just made durable while new writes carry on into the fresh one. With one
-//! file the truncation could only happen if nothing was being written at that
-//! moment, which is exactly when it is least needed.
+//! A table keeps two log files and swaps between them. A flush freezes the
+//! memtable and sends appends to the other file. It can then truncate the log
+//! it made durable, while new writes carry on into the fresh one.
+//!
+//! With one file, a truncation would be safe only while nothing was written.
+//! That is exactly when it is least needed.
 
 pub mod file;
 pub mod record;

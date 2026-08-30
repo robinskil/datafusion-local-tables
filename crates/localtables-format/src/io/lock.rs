@@ -12,9 +12,10 @@ use crate::{Error, Result};
 /// A held advisory lock. Dropping it releases the lock.
 ///
 /// The lock owns its own handle on purpose. An advisory lock belongs to the
-/// open file description, not the descriptor, so a lock taken on a `try_clone`
-/// of someone else's handle would outlive this value and only release when
-/// that other handle closed too.
+/// open file description, not to the descriptor.
+///
+/// A lock taken on a `try_clone` of another handle would outlive this value. It
+/// would release only when that other handle closed.
 #[derive(Debug)]
 pub struct FileLock {
     /// Closing this handle releases the lock. Nothing else refers to it.

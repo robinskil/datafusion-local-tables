@@ -176,10 +176,10 @@ impl TableFile {
         let header: FileHeader =
             rkyv::deserialize::<_, rkyv::rancor::Error>(archived).map_err(Error::from)?;
 
-        // The manifest before the schema, because the manifest is what says
-        // which schema is in force. The header's is only the one the table was
-        // created with, and a table that has since changed it must not be read
-        // through the old one.
+        // The manifest comes before the schema, because the manifest says which
+        // schema is in force. The header holds only the schema the table was
+        // created with. A table that has changed it must not read through the
+        // old one.
         let (committed, next_slot_manifest) = read_committed(io.as_ref()).await?;
         let next_slot = committed.slot.other();
 
@@ -213,10 +213,9 @@ impl TableFile {
 
     /// Store a schema and return where it landed.
     ///
-    /// Schema blobs are appended and never freed. They are small next to the
-    /// data, and one stays reachable for every commit a reader might still be
-    /// pinned to, which is what the free list would otherwise have to reason
-    /// about.
+    /// A schema blob appends and never frees. Blobs are small next to the data.
+    /// One stays reachable for every commit a reader may still hold, which is
+    /// what the free list would otherwise have to track.
     pub async fn write_schema(&self, schema: &Schema) -> Result<Extent> {
         let bytes = schema_codec::encode(schema);
         let framed = frame::encode(tag::SCHEMA, &bytes);
@@ -450,9 +449,9 @@ fn take_lock(path: &Path, read_only: bool) -> Result<FileLock> {
 
 /// Derive a table identity without pulling in a uuid dependency.
 ///
-/// The value only has to be unique enough to stop a WAL sidecar attaching to a
-/// different table, so a hash of the path, the creation time and the schema
-/// extent is enough.
+/// The value needs only enough uniqueness to stop a WAL sidecar from attaching
+/// to a different table. A hash of the path, the creation time and the schema
+/// extent gives that.
 fn new_table_uuid(path: &Path, schema: Extent) -> [u8; 16] {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -480,11 +479,12 @@ const MANIFEST_SLACK: u64 = 256;
 
 /// Serialize a manifest, place it at the end of the file, and write it.
 ///
-/// A manifest records the file length that includes the manifest itself, so
-/// the record and the value inside it have to agree. Reserving a slot slightly
-/// larger than the record breaks the circularity: the slot size is fixed before
-/// the final serialization, and the frame header carries its own payload
-/// length, so the unused tail of the slot is simply padding.
+/// A manifest records the file length that includes the manifest itself. So the
+/// record and the value inside it must agree.
+///
+/// A slot slightly larger than the record breaks that circle. The slot size is
+/// fixed before the final serialization. The frame header carries its own
+/// payload length, so the unused tail of the slot is padding.
 ///
 /// Manifests always go at the end of the file, never into a free extent. Old
 /// manifests join the free list and are reused by segments instead.
@@ -999,9 +999,9 @@ mod tests {
 
     /// Crash at every byte boundary of a commit and check what survives.
     ///
-    /// A commit must be all or nothing: reopening after a crash gives either
-    /// the state before the commit or the state after it, and never a mix, a
-    /// panic, or an unreadable file.
+    /// A commit must be all or nothing. A reopen after a crash gives the state
+    /// before the commit, or the state after it. It never gives a mix, a panic,
+    /// or an unreadable file.
     #[tokio::test]
     async fn a_commit_is_atomic_at_every_crash_point() {
         use crate::io::fault::FaultIo;

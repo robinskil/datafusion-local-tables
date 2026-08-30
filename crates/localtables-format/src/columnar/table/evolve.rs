@@ -9,12 +9,17 @@ impl ColumnarTable {
 
     // ---- Schema changes -------------------------------------------------
     //
-    // Two shapes. A change that leaves every stored byte meaning what it meant
-    // records a new schema and nothing else. A change that does not rewrites
-    // every segment *in the same commit* as the new schema, so there is never
-    // an instant where the schema says one thing and a segment holds another.
-    // That is what keeps zone maps, filters and the zero-copy read path honest
-    // through a schema change: a segment always matches the schema in force.
+    // Two shapes.
+    //
+    // A change that leaves every stored byte meaning what it meant records a
+    // new schema and nothing else.
+    //
+    // A change that does not rewrites every segment *in the same commit* as the
+    // new schema. No instant exists where the schema says one thing and a
+    // segment holds another.
+    //
+    // That keeps zone maps, filters and the zero-copy read path honest. A
+    // segment always matches the schema in force.
 
     /// Add a column to the end of the schema.
     ///
@@ -91,12 +96,15 @@ impl ColumnarTable {
 
     /// Change a column's type.
     ///
-    /// Rewrites every segment, casting as it goes, so that afterwards every
-    /// segment holds the new type. The alternative is casting at read time,
-    /// which would cost the column its zero-copy path on every scan and leave
-    /// zone maps recorded in the old type and unusable. A cast that cannot
-    /// represent a stored value fails the whole change rather than committing
-    /// nulls in place of data.
+    /// This rewrites every segment and casts each one. Afterwards every segment
+    /// holds the new type.
+    ///
+    /// The alternative is a cast at read time. That would cost the column its
+    /// zero-copy path on every scan. It would also leave every zone map in the
+    /// old type, and so unusable.
+    ///
+    /// A cast that cannot represent a stored value fails the whole change. It
+    /// does not commit nulls in place of data.
     pub async fn cast_column(&self, name: &str, to: DataType) -> Result<()> {
         let current = self.schema();
         let at = current.index_of(name).map_err(|_| {
@@ -121,9 +129,11 @@ impl ColumnarTable {
     /// Commit a new schema, rewriting the data first when it has to.
     ///
     /// `rewrite` says whether the stored bytes still mean what the new schema
-    /// says. When they do not, every live row is read under the old schema,
-    /// converted, and written under the new one, and the new segments and the
-    /// new schema land in a single commit.
+    /// says.
+    ///
+    /// Where they do not, this reads every live row under the old schema,
+    /// converts it, and writes it under the new one. The new segments and the
+    /// new schema land in one commit.
     pub(super) async fn set_schema(&self, schema: SchemaRef, rewrite: bool) -> Result<()> {
         // Anything still in the memtable or the log is shaped by the old
         // schema. Landing it first means the change only has segments to think

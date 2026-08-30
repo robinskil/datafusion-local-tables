@@ -1,11 +1,14 @@
 //! An IO backend that stops writing partway through, to stand in for a crash.
 //!
-//! Crash safety is the property that is hardest to test by accident, because
-//! the interesting failures happen between two writes. This wrapper makes the
-//! failure point a parameter: give it a byte budget, and it passes writes
-//! through until the budget runs out, then tears the write that crosses the
-//! line and fails every write after it. Sweeping the budget from zero to the
-//! size of a commit exercises every crash point in that commit.
+//! Crash safety is the hardest property to test by accident. The interesting
+//! failures happen between two writes.
+//!
+//! This wrapper makes the failure point a parameter. Give it a byte budget. It
+//! passes writes through until the budget runs out. It then tears the write
+//! that crosses the line, and fails every write after it.
+//!
+//! Sweep the budget from zero to the size of a commit. That covers every crash
+//! point in that commit.
 //!
 //! Available under `cfg(test)` and behind the `testing` feature.
 

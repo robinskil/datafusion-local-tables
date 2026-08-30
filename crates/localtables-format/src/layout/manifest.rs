@@ -43,8 +43,8 @@ impl SegmentEntry {
 
 /// A byte range no live commit references any more.
 ///
-/// `freed_txn` records when it became garbage. The allocator hands it out only
-/// after every snapshot older than that txn is dropped, because those snapshots
+/// `freed_txn` records when the range became garbage. The allocator gives it
+/// out only after every snapshot older than that txn is gone. Those snapshots
 /// may hold Arrow buffers mapped straight onto these bytes.
 #[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[rkyv(derive(Debug))]
@@ -65,13 +65,14 @@ pub struct Manifest {
     pub next_seqno: u64,
     /// The schema this commit's data was written against.
     ///
-    /// The header points at the schema a table was created with and can never
-    /// be rewritten; this is the one in force now. A commit that changes the
-    /// schema writes a new blob and points here at it, in the same commit as
-    /// whatever segments the change required, so the two can never disagree.
+    /// The header points at the schema a table was created with, and never
+    /// changes. This field points at the schema in force now.
     ///
-    /// Empty means the table has never changed its schema and the header's
-    /// still stands.
+    /// A commit that changes the schema writes a new blob and points here at
+    /// it. It does so in the same commit as the segments the change needed, so
+    /// the two can never disagree.
+    ///
+    /// Empty means the schema never changed, and the header's still stands.
     pub schema: Extent,
     pub segments: Vec<SegmentEntry>,
     pub free_extents: Vec<FreeExtent>,

@@ -1,20 +1,22 @@
 //! Zone maps, in the shape DataFusion's pruning wants them.
 //!
 //! Each segment is one "container". DataFusion asks for the minimum, maximum,
-//! null count and row count of a column across all containers, works out which
-//! ones a predicate cannot match, and the scan skips those without reading a
-//! byte of their data.
+//! null count and row count of a column across all containers. It then works
+//! out which containers a predicate cannot match. The scan skips those and
+//! reads none of their data.
 //!
 //! Equality is the case zone maps handle worst. On a column of scattered
-//! values every segment's range spans the value being looked for, so nothing is
-//! ruled out. Where a segment carries a membership filter, [`contained`] answers
-//! that case instead.
+//! values, every segment's range spans the value. Nothing is ruled out.
+//!
+//! Where a segment carries a membership filter, [`contained`] answers that case
+//! instead.
 //!
 //! [`contained`]: PruningStatistics::contained
 //!
-//! The interval reasoning is DataFusion's own. This file only reports what the
-//! zone maps know, and reports nothing where they do not know: a null entry
-//! means "no information", which costs a segment read, while a wrong entry
+//! The interval reasoning is DataFusion's own. This file reports what the zone
+//! maps know, and nothing where they do not know.
+//!
+//! A null entry means "no information". It costs a segment read. A wrong entry
 //! would lose rows.
 
 use std::collections::HashSet;
@@ -113,10 +115,11 @@ fn find(filters: &[(usize, BloomFilter)], index: usize) -> Option<&BloomFilter> 
 
 /// Bounds for the pages inside one segment, in the shape pruning wants.
 ///
-/// The same reasoning as [`SegmentStatistics`], one level down: there a
-/// container is a segment and the answer is whether to read it, here a
-/// container is a row range inside one and the answer is whether to hand it on.
-/// A page with no bounds contributes a null, which reads as "could match".
+/// This is [`SegmentStatistics`] one level down. There a container is a
+/// segment, and the answer is whether to read it. Here a container is a row
+/// range inside a segment, and the answer is whether to hand it on.
+///
+/// A page with no bounds gives a null, which reads as "could match".
 #[derive(Debug)]
 pub struct PageStatistics {
     schema: SchemaRef,

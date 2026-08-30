@@ -1,9 +1,11 @@
 //! The scan plan for a columnar table.
 //!
-//! Every surviving segment, and every batch still held in memory, is one piece
-//! of work. Partitions take pieces from a shared queue rather than being handed
-//! a fixed share when the plan is built, so a partition that draws a cheap
-//! piece comes back for another instead of finishing early.
+//! Every surviving segment is one piece of work. So is every batch still in
+//! memory.
+//!
+//! Partitions take pieces from a shared queue. The plan does not hand out a
+//! fixed share. A partition that draws a cheap piece comes back for another,
+//! rather than finish early.
 
 use std::fmt;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -50,12 +52,15 @@ pub(crate) fn to_df_error(error: localtables_format::Error) -> DataFusionError {
 
 /// The work a scan has left to do, shared by every partition.
 ///
-/// Partitions take from this rather than being handed a fixed share when the
-/// plan is built. A static split is only as good as its guess about how long
-/// each piece takes, and the pieces are not equal: the last row group of a
-/// flush is a partial one, compaction leaves uneven ones behind, and a
-/// compressed segment costs more to decode than a mapped one. Whichever
-/// partition finishes first takes the next piece, so none of that matters.
+/// Partitions take from this queue. The plan does not hand out a fixed share.
+///
+/// A fixed split is only as good as its guess at how long each piece takes, and
+/// the pieces are not equal. The last row group of a flush is a partial one.
+/// Compaction leaves uneven ones behind. A compressed segment costs more to
+/// decode than a mapped one.
+///
+/// Whichever partition finishes first takes the next piece. None of that then
+/// matters.
 #[derive(Debug)]
 struct Morsels {
     work: Vec<Work>,
@@ -103,10 +108,11 @@ impl PageFilters {
 
     /// Which pages of a segment are worth handing on.
     ///
-    /// `None` means all of them, which is the answer whenever the segment has
-    /// no page bounds, the predicates mention nothing it records, or anything
-    /// at all goes wrong. Pruning is an optimisation: a failure here costs a
-    /// read and never a row.
+    /// `None` means all of them. That is the answer when the segment has no
+    /// page bounds, when the predicates name nothing it records, and when
+    /// anything goes wrong.
+    ///
+    /// Pruning is an optimisation. A failure here costs a read, never a row.
     fn keep_pages(&self, schema: &SchemaRef, reader: &SegmentReader) -> Option<Vec<bool>> {
         if self.is_empty() {
             return None;

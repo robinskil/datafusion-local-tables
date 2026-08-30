@@ -1,16 +1,16 @@
 //! File IO backends.
 //!
-//! Every backend implements [`FileIo`]. Reads return a [`SharedBuf`], which is
-//! either an owned allocation or a zero-copy window into a mapping, so the
-//! decode path stays the same whichever backend a table uses.
+//! Every backend implements [`FileIo`]. A read returns a [`SharedBuf`]. That is
+//! either an owned allocation or a zero-copy window into a mapping. The decode
+//! path stays the same for every backend.
 //!
 //! The trait splits reads in two, because the two have different contracts:
 //!
 //! * [`FileIo::read_at`] reads a region that may still change (meta pages, the
 //!   WAL tail). It always returns the current bytes.
-//! * [`FileIo::read_immutable`] reads a region a commit already sealed. The
-//!   caller promises the bytes never change again, which lets a backend hand
-//!   back a mapping instead of a copy.
+//! * [`FileIo::read_immutable`] reads a region a commit sealed. The caller
+//!   promises those bytes never change again. A backend can then return a
+//!   mapping instead of a copy.
 
 pub mod buf;
 pub mod lock;

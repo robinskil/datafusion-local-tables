@@ -1,12 +1,13 @@
 //! Memory-mapped reads.
 //!
-//! Sealed regions are mapped once and read with no syscall and no copy. The
-//! mapping becomes the owner of every Arrow buffer carved out of it, so a
-//! `RecordBatch` handed to a query points straight at the page cache.
+//! A sealed region maps once. Reads then need no syscall and no copy.
 //!
-//! Writes go through positional writes, not the mapping. Only committed,
-//! never-rewritten regions are mapped, so a mapping's contents never change
-//! under a reader.
+//! The mapping owns every Arrow buffer cut out of it. A `RecordBatch` given to
+//! a query points straight at the page cache.
+//!
+//! Writes use positional writes, not the mapping. Only committed regions map,
+//! and a commit never rewrites them, so a mapping never changes under a
+//! reader.
 
 use std::collections::HashMap;
 use std::path::Path;

@@ -1,13 +1,11 @@
 //! Storage engine for Arrow tables held in a single local file.
 //!
-//! Two table shapes sit on one shared format layer:
+//! One table shape: a columnar table built for scans. It has zone maps,
+//! membership filters, per-column encodings and per-column compression.
 //!
-//! * a columnar table, for scans, with zone maps, encodings and compression;
-//! * a b-tree table, for point lookups and key ranges.
-//!
-//! Both keep their metadata as rkyv archives, so opening a table reads no more
-//! than it must, and column data as raw Arrow buffers, so a scan can hand the
-//! page cache straight to a query with no copy in between.
+//! Metadata sits in rkyv archives, so a table open reads no more than it must.
+//! Column data sits in raw Arrow buffers, so a scan gives the page cache
+//! straight to a query with no copy between.
 //!
 //! This crate holds the format and the engine. The DataFusion providers live in
 //! the `datafusion-local-tables` crate.

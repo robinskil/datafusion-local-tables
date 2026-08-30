@@ -1,15 +1,18 @@
 //! The columnar table.
 //!
-//! One writer, many readers, one file. Writers take a mutex; readers load the
-//! current snapshot with no lock at all and hold it for as long as they need
-//! it. A snapshot pins the bytes it reads, so the allocator will not hand those
-//! bytes to a later write while a query is still looking at them.
+//! One writer, many readers, one file. A writer takes a mutex. A reader loads
+//! the current snapshot with no lock, and holds it as long as it needs.
+//!
+//! A snapshot pins the bytes it reads. The allocator will not give those bytes
+//! to a later write while a query still reads them.
 //!
 //! A write does not build a segment. It appends a record to the write-ahead
-//! log, waits for one sync, and lands in the memtable, where scans can already
-//! see it. A flush later turns the accumulated rows into one segment, commits
-//! it, and empties the log. That is what keeps a three-row insert from costing
-//! a whole segment write.
+//! log, waits for one sync, and lands in the memtable. Scans see it there at
+//! once.
+//!
+//! A later flush turns the collected rows into segments, commits them, and
+//! empties the log. That is what stops a three-row insert from costing a whole
+//! segment write.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

@@ -1,10 +1,11 @@
 //! Schema storage.
 //!
 //! The Arrow schema is the one place the format borrows Arrow's IPC encoding.
-//! It is written once at creation, read once at open, and never sits on a hot
-//! path, so the flatbuffer round trip costs nothing that matters. Column data
-//! never touches IPC: it is stored as raw Arrow buffers so a scan can decode
-//! one column without touching the others.
+//! The writer writes it once at creation. A reader reads it once at open. It
+//! never sits on a hot path, so the flatbuffer round trip costs nothing.
+//!
+//! Column data never touches IPC. It sits in raw Arrow buffers, so a scan can
+//! decode one column and leave the others alone.
 
 use arrow_ipc::convert::{fb_to_schema, IpcSchemaEncoder};
 use arrow_ipc::writer::DictionaryTracker;

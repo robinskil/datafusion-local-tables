@@ -15,9 +15,9 @@ impl ColumnarTable {
 
     /// Open a segment under a schema that is not necessarily the current one.
     ///
-    /// A rewrite reads under the schema the segments were written with and
-    /// writes under the one replacing it, in the same pass, so neither can be
-    /// taken from the handle.
+    /// A rewrite reads under the schema the segments carry. It writes under the
+    /// schema that replaces it, in the same pass. So neither schema can come
+    /// from the handle.
     pub(super) async fn segment_reader_as(
         &self,
         entry: &SegmentEntry,
@@ -147,8 +147,8 @@ impl ColumnarTable {
 /// The row ranges a page selection asks for, with neighbours joined.
 ///
 /// Pages that sit next to each other become one range. A scan that keeps most
-/// of a segment then decodes it in a few passes rather than one per page, and
-/// a scan that keeps all of it decodes it in one.
+/// of a segment then decodes it in a few passes, not one per page. A scan that
+/// keeps all of it decodes it in one.
 pub(super) fn kept_ranges(reader: &SegmentReader, keep: &[bool]) -> Result<Vec<(usize, usize)>> {
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for (page, wanted) in keep.iter().enumerate() {

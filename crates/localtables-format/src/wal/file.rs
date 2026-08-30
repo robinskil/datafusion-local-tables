@@ -1,12 +1,13 @@
 //! One write-ahead log file: appending records, and reading them back.
 //!
 //! A log file is a 64-byte header followed by framed records. Recovery reads
-//! forward, checking each frame, and stops at the first one that does not check
-//! out. That frame is where the crash happened, so everything from it on is
-//! discarded and the file is truncated back to the last good record.
+//! forward and checks each frame. It stops at the first frame that fails.
 //!
-//! Tables keep two of these and swap between them, so a flush can truncate the
-//! log it just made durable while new writes go to the other one.
+//! That frame is where the crash happened. Recovery discards it and everything
+//! after it, then truncates the file back to the last good record.
+//!
+//! A table keeps two of these files and swaps between them. A flush can then
+//! truncate the log it made durable while new writes go to the other one.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};

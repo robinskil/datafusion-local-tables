@@ -1,15 +1,17 @@
 //! io_uring reads, on Linux.
 //!
 //! The point of this backend is [`FileIo::read_scattered`]. A scan of one
-//! segment needs every projected column's byte ranges; through `pread` that is
-//! one syscall each, and through io_uring it is one submission for all of them,
-//! with the kernel free to reorder and overlap the reads.
+//! segment needs the byte ranges of every projected column.
 //!
-//! The ring is owned by one dedicated thread. It is not integrated with tokio's
-//! driver: callers hand it an operation and await a oneshot, which keeps the
-//! unsafe part small and self-contained. Writes go through positional writes,
-//! because the write path is sequential appends followed by a sync, which
-//! io_uring does not make faster.
+//! Through `pread` that costs one syscall each. Through io_uring it costs one
+//! submission for all of them, and the kernel may reorder and overlap them.
+//!
+//! One dedicated thread owns the ring. It does not join tokio's driver. A
+//! caller hands it an operation and awaits a oneshot, which keeps the unsafe
+//! part small.
+//!
+//! Writes use positional writes. The write path is sequential appends followed
+//! by a sync, and io_uring does not make that faster.
 
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
