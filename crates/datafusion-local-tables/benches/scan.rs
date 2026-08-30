@@ -685,7 +685,7 @@ fn compression_choice(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();
 
-    let build = |name: &'static str, compression: Compression| {
+    let build = |name: &'static str, compression: Compression, block_rows: usize| {
         let path = dir.path().join(format!("{name}.lt"));
         runtime.block_on(async move {
             let table = ColumnarTable::create(
@@ -696,6 +696,7 @@ fn compression_choice(c: &mut Criterion) {
                     io_backend: IoBackend::Mmap,
                     memtable_max_bytes: 256 * 1024 * 1024,
                     compression,
+                    compression_block_rows: block_rows,
                     ..TableOptions::default()
                 },
             )
@@ -710,15 +711,20 @@ fn compression_choice(c: &mut Criterion) {
     };
 
     let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
-    for (name, compression) in [
-        ("raw", Compression::None),
-        ("auto", Compression::Auto),
-        ("lz4", Compression::Lz4),
-        ("zstd", Compression::Zstd),
+    // `whole` compresses each column as one block, which is what the format did
+    // before blocks existed; the others cut it so a range can be decompressed
+    // on its own.
+    for (name, compression, block_rows) in [
+        ("raw", Compression::None, 0),
+        ("auto", Compression::Auto, 8 * 1024),
+        ("auto_whole", Compression::Auto, 0),
+        ("lz4", Compression::Lz4, 8 * 1024),
+        ("zstd", Compression::Zstd, 8 * 1024),
+        ("zstd_whole", Compression::Zstd, 0),
     ] {
         ctx.register_table(
             name,
-            Arc::new(ColumnarTableProvider::new(build(name, compression))),
+            Arc::new(ColumnarTableProvider::new(build(name, compression, block_rows))),
         )
         .unwrap();
         let size: u64 = std::fs::metadata(dir.path().join(format!("{name}.lt")))
@@ -733,7 +739,7 @@ fn compression_choice(c: &mut Criterion) {
         ("point lookup", "SELECT * FROM {} WHERE id = 372145"),
     ] {
         let mut group = c.benchmark_group(format!("compression: {label}"));
-        for table in ["raw", "auto", "lz4", "zstd"] {
+        for table in ["raw", "auto", "auto_whole", "lz4", "zstd", "zstd_whole"] {
             let sql = sql.replace("{}", table);
             group.bench_function(table, |b| b.iter(|| run(&ctx, &runtime, &sql)));
         }

@@ -295,6 +295,29 @@ on the full scan, because the column it reads did not shrink and the writer
 therefore stored it raw: a codec that fails to earn its place is dropped per
 buffer, which protects the zero-copy path without anyone choosing anything.
 
+### Blocks, and what they cost
+
+A compressed column is cut into `compression_block_rows` blocks so a scan can
+decompress a range without decompressing the column. The size that costs depends
+entirely on the codec, because it depends on how far back the codec looks. lz4
+looks 64 KiB whatever it is given; zstd looks much further and loses more when
+cut off.
+
+| setting | file, one block per column | file, 8192-row blocks | point lookup, whole | blocked |
+| --- | --- | --- | --- | --- |
+| auto (lz4 on text) | 11866 KiB | 11893 KiB | 406 us | 421 us |
+| zstd everywhere | 4309 KiB | 4556 KiB | 1.24 ms | **500 us** |
+
+**Blocking costs the default 0.23% and buys zstd 2.5x.** It is close to free for
+lz4, which is why it is on by default, and it is what makes zstd usable at all
+for a selective query: whole-column zstd was three times slower than storing
+raw, and in blocks it is 21% slower at a third of the size.
+
+The block size is separate from `page_rows` on purpose. A zone map costs bytes
+and no processor time, so pruning can be finer than decompression; the defaults
+happen to match, so a page a predicate rules out also costs nothing to
+decompress.
+
 ## Parallel scans
 
 A segment is the unit a scan gives to a partition. Partitions take segments from

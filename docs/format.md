@@ -255,6 +255,30 @@ Compression is the exception: it covers a buffer rather than a page, so a
 compressed chunk is decompressed whole however small the range. Compressing per
 page would fix that and has not been done.
 
+## Compression blocks
+
+A compressed column is cut into `compression_block_rows` blocks, each
+compressed on its own, so a scan can reach a range without decompressing the
+column. The chunk then holds no buffers of its own and its blocks hold the data;
+a range inside one block costs one block, and a range spanning several is
+concatenated.
+
+**Only a compressed column is cut.** Cutting an uncompressed one would cost it
+the zero-copy read path, since a range spanning blocks has to be concatenated,
+and would save nothing: there is no decompression to skip.
+
+This is separate from `page_rows`, and deliberately. A zone map costs bytes and
+no processor time, so pruning can be finer than decompression. The defaults
+match, so a page a predicate rules out also costs nothing to decompress, but
+either can move without the other.
+
+What blocking costs in size depends on how far the codec looks back. lz4 looks
+64 KiB whatever it is given, so cutting costs it about a quarter of a percent.
+zstd looks much further: the same data is 5.7% larger in blocks, and 177% larger
+if the blocks are made small enough. What it buys is that a selective query
+decompresses one block instead of the column, which is worth 2.5x on zstd.
+`docs/performance.md` has the run.
+
 ## Membership filters
 
 A zone map prunes `col = x` only when `x` sits outside a segment's minimum and

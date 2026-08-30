@@ -164,6 +164,23 @@ pub struct ColumnChunk {
     #[rkyv(omit_bounds)]
     pub children: Vec<ColumnChunk>,
     pub zone: super::zonemap::ZoneMap,
+    /// Rows in each block but the last. Zero when the chunk is one block.
+    pub block_rows: u64,
+    /// The chunk cut into independently compressed blocks.
+    ///
+    /// Empty in the ordinary case, where `buffers` and `children` hold the
+    /// whole column and a reader hands Arrow the mapped bytes as they stand.
+    /// When it is not empty those two are empty instead, and every block is a
+    /// chunk of its own covering `block_rows` rows.
+    ///
+    /// This exists so a compressed column can be decompressed in parts. It is
+    /// only ever used for a compressed chunk: splitting an uncompressed one
+    /// would cost it the zero-copy read path and buy nothing, since there is
+    /// nothing to decompress.
+    ///
+    /// A block never holds blocks of its own.
+    #[rkyv(omit_bounds)]
+    pub blocks: Vec<ColumnChunk>,
 }
 
 impl ColumnChunk {
@@ -176,10 +193,20 @@ impl ColumnChunk {
         self.buffers.iter().filter(|b| b.role == BufferRole::Data)
     }
 
+    /// The blocks this chunk is made of, or the chunk itself when it is one.
+    pub fn blocks(&self) -> &[ColumnChunk] {
+        if self.blocks.is_empty() {
+            std::slice::from_ref(self)
+        } else {
+            &self.blocks
+        }
+    }
+
     /// Bytes this chunk occupies on disk, children included.
     pub fn stored_bytes(&self) -> u64 {
         self.buffers.iter().map(|b| b.extent.len).sum::<u64>()
             + self.children.iter().map(|c| c.stored_bytes()).sum::<u64>()
+            + self.blocks.iter().map(|b| b.stored_bytes()).sum::<u64>()
     }
 
     /// True when the chunk can become an Arrow array with no copy.
@@ -214,6 +241,25 @@ impl ArchivedColumnChunk {
 
     pub fn is_zero_copy(&self) -> bool {
         self.encoding == Encoding::Plain && self.codec == Codec::None
+    }
+
+    /// Bytes this chunk occupies on disk, children and blocks included.
+    pub fn stored_bytes(&self) -> u64 {
+        self.buffers
+            .iter()
+            .map(|b| b.extent.len.to_native())
+            .sum::<u64>()
+            + self.children.iter().map(|c| c.stored_bytes()).sum::<u64>()
+            + self.blocks.iter().map(|b| b.stored_bytes()).sum::<u64>()
+    }
+
+    /// The blocks this chunk is made of, or the chunk itself when it is one.
+    pub fn blocks(&self) -> &[ArchivedColumnChunk] {
+        if self.blocks.is_empty() {
+            std::slice::from_ref(self)
+        } else {
+            &self.blocks
+        }
     }
 }
 
@@ -276,6 +322,8 @@ mod tests {
             ],
             children: Vec::new(),
             zone: ZoneMap::unknown(3),
+            block_rows: 0,
+            blocks: Vec::new(),
         }
     }
 

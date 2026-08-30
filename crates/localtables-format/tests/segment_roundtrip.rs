@@ -418,22 +418,15 @@ async fn compression_shrinks_a_compressible_column() {
 
     let plain = options(Compression::None, false);
     let (_d1, plain_reader) = round_trip(&schema, std::slice::from_ref(&original), &plain).await;
-    let plain_size: u64 = plain_reader.meta().unwrap().columns[0]
-        .buffers
-        .iter()
-        .map(|b| b.extent.len.to_native())
-        .sum();
+    // Whole column, because a compressed one may be stored in blocks.
+    let plain_size = plain_reader.meta().unwrap().columns[0].stored_bytes();
 
     let zstd = options(Compression::Zstd, false);
     let (_d2, reader) = round_trip(&schema, std::slice::from_ref(&original), &zstd).await;
     let meta = reader.meta().unwrap();
 
     assert_eq!(meta.columns[0].codec.to_native(), Codec::Zstd);
-    let packed: u64 = meta.columns[0]
-        .buffers
-        .iter()
-        .map(|b| b.extent.len.to_native())
-        .sum();
+    let packed = meta.columns[0].stored_bytes();
     assert!(
         packed < plain_size / 10,
         "{packed} is not much smaller than {plain_size}"
@@ -1376,4 +1369,133 @@ async fn a_range_of_a_compressed_chunk_is_still_correct() {
     let whole = reader.read(None).unwrap();
     let range = reader.read_rows(None, 400, 200).unwrap();
     assert_eq!(range.column(0), &whole.column(0).slice(400, 200));
+}
+
+/// A compressed column is cut into blocks so a range can be decompressed on its
+/// own. The answer must not depend on where the block boundaries fall.
+#[tokio::test]
+async fn a_blocked_column_returns_the_same_rows_as_an_unblocked_one() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+        "body",
+        DataType::Utf8,
+        true,
+    )]));
+    let bodies: Vec<Option<String>> = (0..5_000)
+        .map(|i| (i % 11 != 0).then(|| format!("user{i}@example.com some padding text")))
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(bodies))],
+    )
+    .unwrap();
+
+    let unblocked = TableOptions {
+        compression: Compression::Lz4,
+        compression_block_rows: 0,
+        ..options(Compression::Lz4, false)
+    };
+    let blocked = TableOptions {
+        compression: Compression::Lz4,
+        compression_block_rows: 512,
+        ..options(Compression::Lz4, false)
+    };
+
+    let (_a, whole) = round_trip(&schema, std::slice::from_ref(&batch), &unblocked).await;
+    let (_b, split) = round_trip(&schema, std::slice::from_ref(&batch), &blocked).await;
+
+    let meta = split.meta().unwrap();
+    assert_eq!(meta.columns[0].block_rows.to_native(), 512);
+    assert_eq!(meta.columns[0].blocks.len(), 10);
+    assert!(
+        meta.columns[0].buffers.is_empty(),
+        "a blocked chunk holds its data in its blocks"
+    );
+    assert_eq!(whole.meta().unwrap().columns[0].blocks.len(), 0);
+
+    assert_eq!(split.read(None).unwrap(), batch);
+    assert_eq!(whole.read(None).unwrap(), batch);
+
+    // Ranges inside one block, spanning two, and spanning many.
+    for (start, len) in [
+        (0, 1),
+        (0, 512),
+        (100, 50),
+        (500, 24),
+        (511, 2),
+        (1000, 1500),
+        (4999, 1),
+        (0, 5000),
+    ] {
+        let expected = batch.column(0).slice(start, len);
+        assert_eq!(
+            split.read_rows(None, start, len).unwrap().column(0),
+            &expected,
+            "rows {start}..{}",
+            start + len
+        );
+    }
+}
+
+/// An uncompressed column is never cut, whatever the block size says. Cutting
+/// it would cost the zero-copy read path and save nothing.
+#[tokio::test]
+async fn an_uncompressed_column_is_never_blocked() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from((0..5_000i64).collect::<Vec<i64>>()))],
+    )
+    .unwrap();
+
+    let opts = TableOptions {
+        compression_block_rows: 512,
+        ..options(Compression::None, false)
+    };
+    let (_dir, reader) = round_trip(&schema, std::slice::from_ref(&batch), &opts).await;
+
+    assert_eq!(reader.meta().unwrap().columns[0].blocks.len(), 0);
+    assert!(reader.is_zero_copy(), "blocking must not cost zero-copy");
+    assert_eq!(reader.read(None).unwrap(), batch);
+}
+
+/// The block size is separate from the page size, so pruning can be finer than
+/// decompression or the other way round.
+#[tokio::test]
+async fn block_size_and_page_size_are_independent() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+        "body",
+        DataType::Utf8,
+        false,
+    )]));
+    let bodies: Vec<String> = (0..4_000).map(|i| format!("row {i} padding")).collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(bodies))],
+    )
+    .unwrap();
+
+    let opts = TableOptions {
+        compression: Compression::Lz4,
+        page_rows: 250,
+        compression_block_rows: 1000,
+        ..options(Compression::Lz4, false)
+    };
+    let (_dir, reader) = round_trip(&schema, std::slice::from_ref(&batch), &opts).await;
+
+    assert_eq!(reader.page_rows().unwrap(), 250, "16 pages of bounds");
+    assert_eq!(reader.page_zones(0).unwrap().unwrap().len(), 16);
+    assert_eq!(
+        reader.meta().unwrap().columns[0].blocks.len(),
+        4,
+        "but only 4 blocks to decompress"
+    );
+    assert_eq!(reader.read(None).unwrap(), batch);
+    assert_eq!(
+        reader.read_rows(None, 250, 250).unwrap().column(0),
+        &batch.column(0).slice(250, 250)
+    );
 }

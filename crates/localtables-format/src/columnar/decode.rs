@@ -123,6 +123,14 @@ pub fn decode_column_rows(
             start + len
         )));
     }
+
+    // A chunk cut into blocks holds no buffers of its own. Only the blocks the
+    // range touches are read, which for a compressed column is the whole point:
+    // the rest are never decompressed.
+    if !chunk.blocks.is_empty() {
+        return decode_blocks(chunk, data_type, source, start, len);
+    }
+
     let whole = start == 0 && len == stored_rows;
 
     match chunk.encoding.to_native() {
@@ -159,6 +167,60 @@ pub fn decode_column_rows(
                 .map_err(|e| Error::corrupt(format!("a run-length chunk failed to expand: {e}")))
         }
     }
+}
+
+/// Decode a range out of a chunk that is stored in blocks.
+///
+/// A range inside one block costs one block. A range spanning several is
+/// concatenated, which copies; that is the price of being able to decompress
+/// the parts independently, and it is why an uncompressed chunk is never cut.
+fn decode_blocks(
+    chunk: &ArchivedColumnChunk,
+    data_type: &DataType,
+    source: &dyn BufferSource,
+    start: usize,
+    len: usize,
+) -> Result<ArrayRef> {
+    let block_rows = chunk.block_rows.to_native() as usize;
+    if block_rows == 0 {
+        return Err(Error::corrupt("a chunk holds blocks but no block size"));
+    }
+    if len == 0 {
+        return Ok(arrow_array::new_empty_array(data_type));
+    }
+
+    let first = start / block_rows;
+    let last = (start + len - 1) / block_rows;
+    let mut parts: Vec<ArrayRef> = Vec::with_capacity(last - first + 1);
+
+    for index in first..=last {
+        let block = chunk.blocks.get(index).ok_or_else(|| {
+            Error::corrupt(format!(
+                "block {index} is missing from a chunk of {}",
+                chunk.blocks.len()
+            ))
+        })?;
+        let block_start = index * block_rows;
+        let block_len = block.len.to_native() as usize;
+
+        // Where this block overlaps the range asked for.
+        let from = start.max(block_start) - block_start;
+        let to = (start + len).min(block_start + block_len) - block_start;
+        parts.push(decode_column_rows(
+            block,
+            data_type,
+            source,
+            from,
+            to - from,
+        )?);
+    }
+
+    if parts.len() == 1 {
+        return Ok(parts.pop().expect("one part"));
+    }
+    let refs: Vec<&dyn arrow_array::Array> = parts.iter().map(|p| p.as_ref()).collect();
+    arrow_select::concat::concat(&refs)
+        .map_err(|e| Error::corrupt(format!("blocks of a column failed to join: {e}")))
 }
 
 /// Rebuild the Arrow array a chunk stores, whatever its type.

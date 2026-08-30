@@ -121,10 +121,12 @@ pub fn build_segment(
         // Bounds for each row range inside the segment, so a scan can skip the
         // ranges a predicate rules out rather than hand on the whole segment.
         let pages = page_zones(array.as_ref(), options.page_rows);
-        chunks.push(write_chunk(
+        chunks.push(write_blocked_chunk(
             &mut bytes,
+            array.as_ref(),
             encoded,
             codec,
+            options,
             bloom.as_ref(),
             trigram.as_ref(),
             pages.as_deref(),
@@ -220,6 +222,65 @@ fn concat_columns(
 }
 
 /// Append one encoded column to the segment, padding each buffer.
+/// Write a column, cut into independently compressed blocks where that helps.
+///
+/// Only a compressed column is cut. Splitting an uncompressed one would cost it
+/// the zero-copy read path — a range spanning blocks has to be concatenated —
+/// and buy nothing, since there is nothing to decompress.
+#[allow(clippy::too_many_arguments)]
+fn write_blocked_chunk(
+    bytes: &mut Vec<u8>,
+    array: &dyn Array,
+    encoded: EncodedColumn,
+    codec: Codec,
+    options: &TableOptions,
+    bloom: Option<&BloomFilter>,
+    trigram: Option<&BloomFilter>,
+    pages: Option<&[ZoneMap]>,
+) -> Result<ColumnChunk> {
+    let block_rows = options.compression_block_rows;
+    let rows = array.len();
+    if codec == Codec::None || block_rows == 0 || rows <= block_rows {
+        return write_chunk(bytes, encoded, codec, bloom, trigram, pages);
+    }
+
+    let mut blocks = Vec::with_capacity(rows.div_ceil(block_rows));
+    let mut start = 0;
+    while start < rows {
+        let len = block_rows.min(rows - start);
+        let piece = array.slice(start, len);
+        let piece = encode_column(piece.as_ref(), options)?;
+        blocks.push(write_chunk(bytes, piece, codec, None, None, None)?);
+        start += len;
+    }
+
+    // The outer chunk keeps what describes the column as a whole and holds no
+    // buffers of its own; the blocks hold the data.
+    let mut outer = write_chunk(
+        bytes,
+        EncodedColumn {
+            buffers: Vec::new(),
+            children: Vec::new(),
+            ..encoded
+        },
+        codec,
+        bloom,
+        trigram,
+        pages,
+    )?;
+    outer.block_rows = block_rows as u64;
+    // The outer chunk holds no buffers, so `write_chunk` had nothing to judge
+    // the codec from. What the column is actually stored with is what its
+    // blocks are stored with.
+    outer.codec = if blocks.iter().any(|block| block.codec != Codec::None) {
+        codec
+    } else {
+        Codec::None
+    };
+    outer.blocks = blocks;
+    Ok(outer)
+}
+
 fn write_chunk(
     bytes: &mut Vec<u8>,
     encoded: EncodedColumn,
@@ -297,6 +358,8 @@ fn write_chunk(
         buffers: specs,
         children,
         zone: encoded.zone,
+        block_rows: 0,
+        blocks: Vec::new(),
     })
 }
 

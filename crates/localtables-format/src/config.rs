@@ -196,6 +196,22 @@ pub struct TableOptions {
     /// Zero switches them off. They cost roughly a tenth of a percent of a
     /// segment, so they are on by default.
     pub page_rows: usize,
+    /// Rows in each independently compressed block.
+    ///
+    /// Separate from [`TableOptions::page_rows`] on purpose: a zone map costs
+    /// bytes and no processor time, so pruning can be finer than decompression.
+    /// This is the unit a scan has to decompress to reach any row inside it.
+    ///
+    /// Only a compressed column is cut into blocks. Cutting an uncompressed one
+    /// would cost it the zero-copy read path and save nothing.
+    ///
+    /// Small blocks cost compression ratio, and how much depends entirely on
+    /// the codec. lz4 looks back 64 KiB whatever it is given, so cutting text
+    /// into 8,192-row blocks costs it about 3%. zstd looks much further and
+    /// loses heavily: the same text is 177% larger in 8,192-row blocks than
+    /// compressed whole. The default matches `page_rows`, so a page a predicate
+    /// rules out also costs nothing to decompress.
+    pub compression_block_rows: usize,
     /// Source bytes a rewrite holds in memory at once.
     ///
     /// Compaction and every rewrite read stored rows back before writing them
@@ -243,6 +259,7 @@ impl Default for TableOptions {
             rle_encoding: true,
             cluster_by: Vec::new(),
             page_rows: 8 * 1024,
+            compression_block_rows: 8 * 1024,
             compaction_max_bytes: 256 * 1024 * 1024,
             bloom_filters: BloomFilters::default(),
             trigram_filters: BloomFilters::default(),
