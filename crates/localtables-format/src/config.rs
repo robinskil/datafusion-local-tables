@@ -1,14 +1,17 @@
 //! Tunables for a table handle.
 
-/// Row groups a flush aims to leave the table holding.
+/// Row groups a flush leaves in the table.
 ///
-/// A floor on the count rather than a target: passing it means the groups grow
-/// instead. Enough that a scan has something for every thread with room to
-/// spare, and no more, because a segment is not free — it costs a mapping, a
-/// metadata frame to check and a set of zone maps, measured at roughly five
-/// microseconds each. Scanning the same 500,000 rows cut different ways, at
-/// four partitions: 317 us in 5 segments, 303 in 10, 324 in 20, 458 in 70.
-/// Eight groups puts a table in that flat region without running past it.
+/// This is a floor on the count, not a target. A larger table gets larger
+/// groups, not more of them.
+///
+/// A scan needs one group per thread, and a few spare. It does not need more.
+/// Each segment costs one mapping, one metadata frame, and one set of zone
+/// maps. That cost is about five microseconds.
+///
+/// The same 500,000 rows, cut different ways, at four partitions: 317 us in 5
+/// segments, 303 in 10, 324 in 20, 458 in 70. Eight groups sits in the flat
+/// part of that curve.
 ///
 /// See `docs/performance.md` for the full measurement.
 pub const TARGET_ROW_GROUPS: usize = 8;
@@ -40,15 +43,17 @@ pub enum IoBackend {
 
 /// Which columns get a membership filter.
 ///
-/// A filter answers `col = x` where a zone map cannot: on a column of scattered
-/// values every segment's range spans the value, so no segment is ruled out and
-/// the scan reads all of them. It costs
-/// [`TableOptions::bloom_bits_per_value`] bits for every non-null value, so it
-/// is off by default and asked for per column, the way parquet asks.
+/// A filter answers `col = x` where a zone map cannot. On a column of scattered
+/// values, every segment's range spans the value. No segment is ruled out, and
+/// the scan reads all of them.
 ///
-/// It pays on a column that is looked up by equality and has many distinct
-/// values. It does not pay on a low-cardinality column, where a zone map or a
-/// dictionary already answers, nor on one only ever compared by range.
+/// A filter costs [`TableOptions::bloom_bits_per_value`] bits per distinct
+/// value. It is off by default. Ask for it per column, as parquet does.
+///
+/// It pays on a column with many distinct values that queries compare by
+/// equality. It does not pay on a low-cardinality column, where a zone map or a
+/// dictionary already answers. It does not pay on a column compared only by
+/// range.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum BloomFilters {
     /// No filters. Equality falls back to zone maps.
@@ -77,13 +82,14 @@ impl BloomFilters {
 
 /// How column bytes are compressed.
 ///
-/// Compression is the one thing that costs a column its zero-copy read path: a
-/// compressed chunk has to be decompressed into a buffer the reader owns, where
-/// an uncompressed one is handed to Arrow as the mapped bytes themselves. So the
-/// question is never only how small a codec makes a column, but whether the
-/// column had anything to gain.
+/// Compression is the one thing that costs a column its zero-copy read path.
+/// The reader must decompress a compressed chunk into a buffer it owns. It
+/// gives Arrow an uncompressed chunk as the mapped bytes themselves.
 ///
-/// Measured over 500,000 rows, ratio as uncompressed over compressed:
+/// So the question is not only how small a codec makes a column. The question
+/// is whether the column had anything to gain.
+///
+/// Measured over 500,000 rows. The ratio is uncompressed over compressed:
 ///
 /// | column | lz4 | zstd |
 /// | --- | --- | --- |
@@ -96,30 +102,32 @@ impl BloomFilters {
 pub enum Compression {
     /// Store raw Arrow bytes. Keeps the zero-copy read path everywhere.
     ///
-    /// The default, because a codec is the one thing that takes that path away,
-    /// and this format exists to have it. On a table whose bulk is text,
-    /// compressing costs 2.3x on a full scan for 2.3x the size back; on one
-    /// whose text is low cardinality it costs 2%. Which of those a table gets
-    /// depends on its data, so the cheap answer is the default and
+    /// This is the default. A codec is the one thing that takes that path
+    /// away, and the format exists to have it.
+    ///
+    /// On a table whose bulk is text, a codec costs 2.3x on a full scan and
+    /// returns 2.3x the size. On a table whose text is low cardinality it costs
+    /// 2%. The data decides which. So the cheap answer is the default, and
     /// [`Compression::Auto`] is one line away.
     #[default]
     None,
     /// Compress the columns that gain by it and leave the rest raw.
     ///
-    /// Text and binary get lz4; every other type is stored as it stands. lz4
-    /// rather than zstd because it decompresses two to three times faster and
-    /// still gets most of the size, and the column being compressed is usually
-    /// the bulk of the file.
+    /// Text and binary get lz4. Every other type stays as it stands.
     ///
-    /// Measured over 500,000 rows against storing everything raw: 14% smaller,
-    /// and 2% slower on the worst of three queries tried. Compressing every
-    /// column instead reaches 42% smaller with lz4 and 69% with zstd, and costs
-    /// 42% and 202% on a read of every column.
+    /// lz4 rather than zstd: it decompresses two to three times faster and
+    /// still gets most of the size. The text column is usually the bulk of the
+    /// file.
     ///
-    /// On a table that is mostly high-cardinality text the trade is much
-    /// sharper than that mixed figure suggests: 2.3x smaller, point lookups a
-    /// quarter faster, and full scans 2.3x slower. Worth asking for when size
-    /// matters more than scan throughput, which is why it is not the default.
+    /// Measured over 500,000 rows, against raw: 14% smaller, and 2% slower on
+    /// the worst of three queries. A codec on every column instead reaches 42%
+    /// smaller with lz4 and 69% with zstd. It costs 42% and 202% on a read of
+    /// every column.
+    ///
+    /// On a table that is mostly high-cardinality text the trade is sharper:
+    /// 2.3x smaller, point lookups a quarter faster, full scans 2.3x slower.
+    /// Ask for it when size matters more than scan speed. That is why it is not
+    /// the default.
     Auto,
     /// lz4 for every column, whatever it holds.
     Lz4,
@@ -141,10 +149,10 @@ impl Compression {
     }
 }
 
-/// True for the types whose bytes are worth compressing.
+/// True for the types whose bytes are worth compression.
 ///
-/// Text and binary, and the same nested inside a dictionary, which is where a
-/// low-cardinality string column's values live.
+/// Text and binary qualify. So does either one inside a dictionary, which is
+/// where a low-cardinality string column keeps its values.
 fn is_text(data_type: &arrow_schema::DataType) -> bool {
     use arrow_schema::DataType;
     match data_type {
@@ -168,15 +176,15 @@ pub struct TableOptions {
     pub wal_max_bytes: u64,
     /// Largest row group a flush will write.
     ///
-    /// A flush aims for [`TARGET_ROW_GROUPS`] groups across the table and
-    /// clamps the result between [`TableOptions::min_row_group_rows`] and this,
-    /// so a small table is still divisible and a large one does not accumulate
+    /// A flush aims for [`TARGET_ROW_GROUPS`] groups across the table. It
+    /// clamps the result between [`TableOptions::min_row_group_rows`] and this
+    /// value. A small table stays divisible. A large table does not collect
     /// metadata for row groups nobody needs.
     pub row_group_rows: usize,
     /// Smallest row group a flush will write.
     ///
-    /// Below this the per-segment costs — a mapping, a metadata frame, a set of
-    /// zone maps — start to outweigh what dividing the work buys.
+    /// Each segment costs one mapping, one metadata frame, and one set of zone
+    /// maps. Below this size those costs outweigh what the division buys.
     pub min_row_group_rows: usize,
     /// Batch size the scan emits.
     pub scan_batch_rows: usize,
@@ -187,70 +195,75 @@ pub struct TableOptions {
     pub dictionary_encoding: bool,
     /// Try run-length encoding when a column chunk has long runs.
     pub rle_encoding: bool,
-    /// Columns whose bits are interleaved to order rows before they are
-    /// written.
+    /// Columns whose bits interleave to order rows before a flush writes them.
     ///
-    /// Empty means rows keep the order they arrived in, which makes zone maps
-    /// selective on whatever column that order follows and on nothing else. A
-    /// z-order makes them selective on all of these at once, and none of them
-    /// as well as a plain sort would. See `columnar::zorder`.
+    /// Empty leaves rows in the order they arrived. Zone maps are then
+    /// selective on the column that order follows, and on no other.
     ///
-    /// This is a layout, not an index: it stores no extra bytes and cannot
-    /// affect what a query returns.
+    /// A z-order makes them selective on all of these columns at once. It also
+    /// makes them less selective on each one than a plain sort would. See
+    /// `columnar::zorder`.
+    ///
+    /// This is a layout, not an index. It stores no extra bytes. It cannot
+    /// change what a query returns.
     pub cluster_by: Vec<String>,
     /// Rows covered by each page of bounds inside a segment.
     ///
-    /// A segment's own zone map decides whether to read it at all. These decide
-    /// which row ranges inside it a scan bothers to hand on, so a predicate
-    /// that matches a hundred rows of a hundred thousand costs the filter above
-    /// one page rather than the whole segment.
+    /// A segment's own zone map decides whether to read the segment. These
+    /// bounds decide which row ranges inside it the scan hands on.
     ///
-    /// Zero switches them off. They cost roughly a tenth of a percent of a
+    /// A predicate that matches a hundred rows of a hundred thousand then costs
+    /// the filter above one page, not the whole segment.
+    ///
+    /// Zero switches the bounds off. They cost about a tenth of a percent of a
     /// segment, so they are on by default.
     pub page_rows: usize,
     /// Rows in each independently compressed block.
     ///
-    /// Separate from [`TableOptions::page_rows`] on purpose: a zone map costs
-    /// bytes and no processor time, so pruning can be finer than decompression.
-    /// This is the unit a scan has to decompress to reach any row inside it.
+    /// This is separate from [`TableOptions::page_rows`] on purpose. A zone map
+    /// costs bytes and no processor time, so a scan can prune finer than it
+    /// decompresses. A block is the unit a scan must decompress to reach any
+    /// row inside it.
     ///
-    /// Only a compressed column is cut into blocks. Cutting an uncompressed one
-    /// would cost it the zero-copy read path and save nothing.
+    /// A compressed column is always cut. A variable-width column is cut even
+    /// when it is not compressed, because Arrow checks every offset of such a
+    /// column whatever range a reader asks for. A fixed-width column is never
+    /// cut.
     ///
-    /// Small blocks cost compression ratio, and how much depends entirely on
-    /// the codec. lz4 looks back 64 KiB whatever it is given, so cutting text
-    /// into 8,192-row blocks costs it about 3%. zstd looks much further and
-    /// loses heavily: the same text is 177% larger in 8,192-row blocks than
-    /// compressed whole. The default matches `page_rows`, so a page a predicate
-    /// rules out also costs nothing to decompress.
+    /// Small blocks cost compression ratio. How much depends on the codec. lz4
+    /// looks back 64 KiB whatever it gets, so 8,192-row blocks cost it about
+    /// 3%. zstd looks much further and loses more.
+    ///
+    /// The default matches `page_rows`. A page that a predicate rules out then
+    /// costs nothing to decompress.
     pub compression_block_rows: usize,
     /// Source bytes a rewrite holds in memory at once.
     ///
-    /// Compaction and every rewrite read stored rows back before writing them
-    /// out again. Reading all of them first is simple and unbounded: a table
-    /// larger than memory cannot be compacted at all, and neither can its
-    /// schema be changed. Instead the work is cut into runs whose source
-    /// segments total no more than this, measured as the bytes they occupy on
-    /// disk. A run always holds at least one segment, so a single segment
-    /// larger than the budget is still the floor.
+    /// Compaction and every rewrite read stored rows back, then write them out
+    /// again. To read all of them first is simple and unbounded. A table larger
+    /// than memory could then never be compacted, and its schema could never
+    /// change.
     ///
-    /// Clustering is applied within a run, so a table larger than the budget
-    /// comes out clustered in runs rather than as a whole. Raising this trades
-    /// memory for a better layout.
+    /// The work is cut into runs instead. The source segments of one run total
+    /// no more than this many bytes on disk. A run always holds at least one
+    /// segment, so one segment larger than the budget is the floor.
+    ///
+    /// A z-order applies within a run. A table larger than the budget comes out
+    /// clustered per run, not as a whole. Raise this value to trade memory for
+    /// a better layout.
     pub compaction_max_bytes: u64,
     /// Which columns get a membership filter.
     pub bloom_filters: BloomFilters,
     /// Which text columns get a trigram filter, for `LIKE` pruning.
     ///
-    /// Holds three-byte pieces of every value rather than whole values, so a
-    /// substring search can rule out the segments that cannot contain it.
-    /// Larger than a membership filter, because one value contributes as many
-    /// pieces as it has characters. See `columnar::trigram`.
+    /// This filter holds three-byte pieces of every value, not whole values. A
+    /// substring search can then rule out the segments that cannot hold it.
+    /// See `columnar::trigram`.
     pub trigram_filters: BloomFilters,
     /// Bits a membership filter spends per value.
     ///
-    /// More bits means fewer false positives and a larger filter. Ten gives
-    /// roughly one in a hundred, which costs a segment read and never a row.
+    /// More bits give fewer false positives and a larger filter. Ten give about
+    /// one in a hundred. A false positive costs a segment read, never a row.
     pub bloom_bits_per_value: usize,
     /// Open read-only. Skips the writer lock, permits many processes.
     pub read_only: bool,

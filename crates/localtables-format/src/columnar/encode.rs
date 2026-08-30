@@ -30,9 +30,9 @@ pub struct EncodedColumn {
     /// Where the rows start inside the stored buffers. Normally zero.
     pub offset: u64,
     pub zone: ZoneMap,
-    /// Buffers in write order. Each is either a slice of the input array, which
-    /// costs nothing, or a rebuilt buffer where the input could not be used as
-    /// it stood.
+    /// Buffers in write order. Each one is a slice of the input array, which
+    /// costs nothing. Where the input would not serve, it is a rebuilt buffer
+    /// instead.
     pub buffers: Vec<(BufferRole, Buffer)>,
     pub children: Vec<EncodedColumn>,
 }
@@ -93,14 +93,15 @@ pub fn encode_column(array: &dyn Array, options: &TableOptions) -> Result<Encode
 /// Encode an array exactly as Arrow lays it out.
 ///
 /// This is generic over the type stored, and deliberately so. An Arrow array is
-/// a null bitmap, a list of buffers, and a list of child arrays; what those
-/// buffers mean is the type's business, not this function's. Storing that shape
-/// verbatim means every Arrow type works — nested types, dictionaries, and
-/// extension types, whose storage is an ordinary array and whose identity lives
-/// in the schema's field metadata.
+/// a null bitmap, a list of buffers, and a list of child arrays. What those
+/// buffers mean is the type's business, not this function's.
 ///
-/// Nothing is copied for an array that starts at row zero, which is the common
-/// case: the stored bytes are Arrow's own buffers.
+/// To store that shape verbatim makes every Arrow type work. That covers nested
+/// types, dictionaries, and extension types. An extension type's storage is an
+/// ordinary array, and its identity sits in the schema's field metadata.
+///
+/// An array that starts at row zero copies nothing, which is the common case.
+/// The stored bytes are then Arrow's own buffers.
 pub fn encode_plain(array: &dyn Array, zone: ZoneMap) -> Result<EncodedColumn> {
     // A sliced array's buffers belong to its parent and carry rows this column
     // does not own. Compacting rebuilds them around just these rows. Where
@@ -153,16 +154,18 @@ pub fn encode_plain(array: &dyn Array, zone: ZoneMap) -> Result<EncodedColumn> {
 
 /// True when this array's buffers hold its rows and nothing else.
 ///
-/// A slice can carry more than it owns in two ways: by leaving the buffers
-/// alone and setting an offset, or by narrowing one buffer and leaving another
-/// whole — which is what Arrow does when it slices a string column, and why
-/// checking the offset alone is not enough.
+/// A slice can carry more than it owns in two ways. It can leave the buffers
+/// alone and set an offset. It can also narrow one buffer and leave another
+/// whole. Arrow does the second when it slices a string column, which is why a
+/// check of the offset alone is not enough.
 ///
-/// Arrow can say how many bytes the rows need, and that is compared against
-/// the bytes the buffers actually hold. For an array that owns its buffers the
-/// two are equal, for every type measured; a slice that carries its parent's
-/// values is where they diverge. Buffer *capacity* is deliberately not used:
-/// it is rounded up for alignment, which would make every array look wasteful.
+/// Arrow reports how many bytes the rows need. This compares that figure
+/// against the bytes the buffers hold. The two are equal for an array that owns
+/// its buffers, for every type measured. They differ for a slice that carries
+/// its parent's values.
+///
+/// Buffer *capacity* is not used here. Arrow rounds capacity up for alignment,
+/// which would make every array look wasteful.
 fn carries_only_its_own_rows(array: &dyn Array) -> bool {
     if array.offset() != 0 {
         return false;
@@ -191,10 +194,12 @@ fn carries_only_its_own_rows(array: &dyn Array) -> bool {
 /// data buffers hold. `None` for every other type.
 ///
 /// View types are the one family the generic measure cannot judge. Arrow's
-/// `get_slice_memory_size` counts their views and not the data buffers behind
-/// them, so it reports the same figure for a whole array and for a two-row
-/// slice of it — which would have this code compacting every view array and
-/// still never noticing the one that needed it.
+/// `get_slice_memory_size` counts their views, not the data buffers behind
+/// them. It reports the same figure for a whole array and for a two-row slice
+/// of one.
+///
+/// On that figure this code would compact every view array, and would still
+/// miss the one array that needed it.
 fn view_bytes(array: &dyn Array) -> Option<(usize, usize)> {
     fn measure<T: arrow_array::types::ByteViewType>(
         array: &arrow_array::GenericByteViewArray<T>,
@@ -214,13 +219,13 @@ fn view_bytes(array: &dyn Array) -> Option<(usize, usize)> {
 
 /// Copy an array into fresh buffers holding only its own rows.
 ///
-/// `concat` of a single array short-circuits to a slice, which is exactly what
-/// needs undoing, so an empty array of the same type goes in front to take the
+/// `concat` of one array short-circuits to a slice, which is the very thing
+/// this must undo. An empty array of the same type goes in front, to force the
 /// general path. Returns `None` for the types `concat` does not handle.
 ///
-/// View arrays take a different route: concatenating them keeps the data
-/// buffers as they are, so it cannot reclaim anything. `gc` is the operation
-/// that rebuilds them around the values the views actually point at.
+/// View arrays take a different route. `concat` keeps their data buffers as
+/// they are and reclaims nothing. `gc` rebuilds them around the values the
+/// views point at.
 fn compact(array: &dyn Array) -> Option<ArrayRef> {
     match array.data_type() {
         DataType::Utf8View => return Some(Arc::new(array.as_string_view().gc())),

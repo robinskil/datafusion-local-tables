@@ -1,9 +1,8 @@
 //! Per-buffer compression.
 //!
-//! Compression is applied to one Arrow buffer at a time, not to a whole row
-//! batch. A scan that needs two of forty columns decompresses two columns'
-//! worth of bytes, and a column stored with no codec is handed to Arrow
-//! without being touched at all.
+//! A codec applies to one Arrow buffer at a time, not to a whole row batch. A
+//! scan that needs two of forty columns decompresses two columns' worth of
+//! bytes. A column stored with no codec goes to Arrow untouched.
 
 use crate::columnar::page::Codec;
 use crate::io::buf::IoBuf;
@@ -11,8 +10,8 @@ use crate::{Error, Result};
 
 /// Compress `bytes` with `codec`.
 ///
-/// Returns `None` when the result would not be smaller, so a buffer that does
-/// not compress keeps the zero-copy read path instead of paying to decompress
+/// Returns `None` when the result is not smaller. A buffer that does not
+/// compress then keeps the zero-copy read path. It does not pay to decompress
 /// the same number of bytes.
 pub fn compress(codec: Codec, bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     let packed = match codec {

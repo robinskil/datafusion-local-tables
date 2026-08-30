@@ -93,18 +93,22 @@ fn index_of(trigram: &[u8]) -> usize {
 
 /// Build a trigram filter over an array's non-null values.
 ///
-/// Sized by the number of *distinct* trigrams rather than the number produced.
-/// A column of prose repeats its trigrams heavily, and a filter sized for every
-/// repeat would be many times larger for no gain, since inserting the same item
-/// twice tells the filter nothing new. That is what keeps the cost near zero on
-/// ordinary text and moderate on identifiers.
+/// The filter is sized by the number of *distinct* trigrams, not the number
+/// produced. A column of prose repeats its trigrams heavily. To insert the same
+/// piece twice tells the filter nothing new, so a filter sized for every repeat
+/// would be many times larger for no gain.
 ///
-/// `max_bytes` abandons the filter when it would be larger than that. There are
-/// only 2^24 possible trigrams, and a column of near-random bytes approaches
-/// all of them: about 21 MiB of filter per chunk, to rule out almost nothing,
-/// since a search term's pieces are then present whatever it is. Callers pass
-/// the size of the column itself, so a filter never outweighs the data it
-/// describes. No filter prunes nothing, which costs reads and never rows.
+/// That keeps the cost near zero on ordinary text and moderate on identifiers.
+///
+/// `max_bytes` abandons the filter when it would exceed that size. Only 2^24
+/// trigrams exist. A column of near-random bytes approaches all of them: about
+/// 21 MiB of filter per chunk.
+///
+/// Such a filter rules out almost nothing, because a search term's pieces are
+/// then always present. Callers pass the size of the column itself, so a filter
+/// never outweighs the data it describes.
+///
+/// No filter prunes nothing. That costs reads, never rows.
 pub fn build(
     array: &dyn Array,
     bits_per_value: usize,

@@ -1,9 +1,10 @@
 //! Which rows of a segment have been deleted.
 //!
-//! Segments never change once written, so a delete records a row position
-//! rather than rewriting data. The positions live in a roaring bitmap, which
-//! costs a few bytes for a scattered handful of deletes and a few bytes again
-//! for a whole segment deleted at once.
+//! A segment never changes once written. So a delete records a row position
+//! and rewrites no data.
+//!
+//! The positions live in a roaring bitmap. That costs a few bytes for a
+//! scattered handful of deletes, and a few bytes again for a whole segment.
 //!
 //! A scan applies the bitmap as a mask. Compaction eventually rewrites the
 //! segment without the deleted rows and drops the bitmap.

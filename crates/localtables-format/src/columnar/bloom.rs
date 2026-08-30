@@ -1,19 +1,19 @@
 //! Per-column membership filters, for the predicates zone maps cannot help.
 //!
 //! A zone map prunes `col = x` only when `x` falls outside a segment's minimum
-//! and maximum. For a column of scattered values — an id, a hash, a name — every
-//! segment spans nearly the whole range, so every segment survives and the scan
+//! and maximum. Take a column of scattered values: an id, a hash, a name. Every
+//! segment spans nearly the whole range. Every segment survives, and the scan
 //! reads all of them to find one row.
 //!
-//! A membership filter answers a different question: *is this value definitely
-//! absent?* It can say no when it is sure and shrug otherwise, and being sure is
-//! enough to skip a segment. The filter never says a value is absent when it is
-//! present; that direction would lose rows, and it is the property the tests
-//! hammer hardest.
+//! A membership filter answers a different question. *Is this value definitely
+//! absent?* It answers no when it is sure. It shrugs otherwise. To be sure is
+//! enough to skip a segment.
 //!
-//! The layout is the split-block filter parquet uses: the bits for one value all
-//! live in a single 32-byte block, so a lookup touches one cache line rather
-//! than eight scattered words.
+//! The filter never reports a value absent when that value is present. That
+//! direction would lose rows. The tests hammer that property hardest.
+//!
+//! The layout is the split-block filter parquet uses. The bits for one value
+//! all sit in one 32-byte block, so a lookup touches one cache line.
 
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
@@ -204,9 +204,9 @@ fn hash_value(value: &ArrayRef, data_type: &DataType) -> Option<u64> {
         cast = arrow_cast::cast(value, data_type).ok()?;
         &cast
     };
-    // A cast that cannot represent the value produces a null rather than an
-    // error, so the null has to be caught here as well as above. Either way it
-    // says nothing about what is stored, and pruning on it would lose rows.
+    // A cast that cannot represent the value gives a null, not an error. So the
+    // null needs a check here as well as above. A null says nothing about what
+    // the column holds, and to prune on it would lose rows.
     if array.is_null(0) {
         return None;
     }

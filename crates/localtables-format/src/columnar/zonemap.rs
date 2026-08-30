@@ -92,8 +92,9 @@ impl ZoneMap {
 
     /// The minimum as a one-element array of `data_type`.
     ///
-    /// Returns `None` when the bound is unknown or cannot be read back as this
-    /// type, which callers must treat as "no information", never as a match.
+    /// Returns `None` when the bound is unknown. It also returns `None` when
+    /// the bound cannot be read back as this type. A caller must read `None` as
+    /// "no information", never as a match.
     pub fn min_array(&self, data_type: &DataType) -> Option<ArrayRef> {
         decode_bound(self.min.as_deref()?, data_type)
     }

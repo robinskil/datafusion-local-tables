@@ -75,15 +75,16 @@ impl ArchivedCodec {
 
 /// What a stored buffer means to the decoder.
 ///
-/// A chunk holds the null bitmap, then Arrow's own buffers for the array in
-/// Arrow's own order. What each of those buffers means depends on the type —
-/// offsets for a string, values for an integer, indices for a dictionary — and
-/// the decoder does not need to know: it hands them back to Arrow in the same
-/// order, and Arrow's own validation decides whether they make sense.
+/// A chunk holds the null bitmap, then Arrow's own buffers for the array, in
+/// Arrow's own order. What each buffer means depends on the type: offsets for a
+/// string, values for an integer, indices for a dictionary.
 ///
-/// That is what makes the format generic over the type stored. Naming the
-/// bitmap separately is still worth it, because it is the one buffer Arrow
-/// keeps outside `ArrayData::buffers`.
+/// The decoder does not need to know. It hands the buffers back to Arrow in the
+/// same order, and Arrow's validation decides whether they make sense. That is
+/// what makes the format generic over the type stored.
+///
+/// The bitmap still earns a name of its own. It is the one buffer Arrow keeps
+/// outside `ArrayData::buffers`.
 #[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[rkyv(derive(Debug), compare(PartialEq))]
 #[repr(u8)]
@@ -104,9 +105,9 @@ pub enum BufferRole {
     Trigram = 3,
     /// Bounds for each page of the chunk, as an rkyv `Vec<ZoneMap>`.
     ///
-    /// Also not Arrow's. A scan reads it to skip the row ranges inside a
-    /// segment that a predicate rules out, where the chunk's own zone map only
-    /// says whether to read the segment at all.
+    /// Also not Arrow's. A scan reads it to skip the row ranges a predicate
+    /// rules out. The chunk's own zone map says only whether to read the
+    /// segment.
     PageZones = 4,
 }
 
@@ -152,9 +153,11 @@ pub struct ColumnChunk {
     pub run_count: u64,
     /// Where this array's rows start inside its buffers.
     ///
-    /// Normally zero: a sliced array is compacted before it is stored. It is
-    /// recorded anyway for the types Arrow cannot compact, where the parent's
-    /// buffers are stored as they stand and the offset is what makes them
+    /// Normally zero, because the writer compacts a sliced array before it
+    /// stores it.
+    ///
+    /// The offset is recorded for the types Arrow cannot compact. The parent's
+    /// buffers then go to disk as they stand, and the offset is what makes them
     /// readable.
     pub offset: u64,
     pub buffers: Vec<BufferSpec>,

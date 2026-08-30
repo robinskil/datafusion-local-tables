@@ -142,13 +142,12 @@ pub fn decode_column_rows(
         }
 
         // Stored as a dictionary over the column's type, then cast back. The
-        // cast is the price of the smaller file; a column declared as a
-        // dictionary in the schema takes the Plain path instead and pays
-        // nothing.
+        // cast is the price of the smaller file. A column the schema declares
+        // as a dictionary takes the Plain path and pays nothing.
         //
-        // Slicing first costs nothing — a dictionary array slices its keys and
-        // keeps its values — and leaves the cast expanding `len` rows instead
-        // of the whole chunk.
+        // To slice first costs nothing: a dictionary array slices its keys and
+        // keeps its values. The cast then expands `len` rows, not the whole
+        // chunk.
         Encoding::Dictionary => {
             let stored =
                 DataType::Dictionary(Box::new(DataType::Int32), Box::new(data_type.clone()));
@@ -225,10 +224,11 @@ fn decode_blocks(
 
 /// Rebuild the Arrow array a chunk stores, whatever its type.
 ///
-/// The buffers go back to Arrow in the order they were taken, and the children
-/// are rebuilt the same way. Nothing here knows what any particular buffer
-/// means — `build` validates, so a chunk whose bytes do not fit the type is
-/// reported rather than handed on as data.
+/// The buffers go back to Arrow in the order they came out. The children go
+/// back the same way. Nothing here knows what one buffer means.
+///
+/// `build` validates. A chunk whose bytes do not fit the type is reported, not
+/// handed on as data.
 fn rebuild(
     chunk: &ArchivedColumnChunk,
     data_type: &DataType,

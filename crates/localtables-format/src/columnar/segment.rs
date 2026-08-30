@@ -127,8 +127,8 @@ pub fn build_segment(
         } else {
             None
         };
-        // Bounds for each row range inside the segment, so a scan can skip the
-        // ranges a predicate rules out rather than hand on the whole segment.
+        // Bounds for each row range inside the segment. A scan then skips the
+        // ranges a predicate rules out, and hands on the rest.
         let pages = page_zones(array.as_ref(), options.page_rows);
         chunks.push(write_blocked_chunk(
             &mut bytes,
@@ -237,11 +237,10 @@ fn concat_columns(
         .collect()
 }
 
-/// Append one encoded column to the segment, padding each buffer.
-/// Whether this column will be stored in blocks.
+/// Whether this column goes into blocks.
 ///
-/// Asked before the column is encoded as well as while it is written, because
-/// the answer decides whether encoding it whole is worth doing at all.
+/// The writer asks this before it encodes the column, and again as it writes.
+/// The answer decides whether to encode the column whole at all.
 fn blocks_wanted(array: &dyn Array, codec: Codec, options: &TableOptions) -> bool {
     let block_rows = options.compression_block_rows;
     block_rows > 0 && array.len() > block_rows && worth_blocking(codec, array.data_type())
@@ -249,19 +248,19 @@ fn blocks_wanted(array: &dyn Array, codec: Codec, options: &TableOptions) -> boo
 
 /// True when cutting a column into blocks pays for itself.
 ///
-/// A compressed column always gains: a block is the unit a reader can
-/// decompress without decompressing the rest.
+/// A compressed column always gains. A block is the unit a reader can
+/// decompress on its own.
 ///
-/// A variable-width column gains even uncompressed, for a reason that is
-/// Arrow's rather than this format's. Handing Arrow a column's buffers makes it
-/// walk every offset to check they are ordered and in bounds, and for text
-/// check every byte is valid, and both cost the whole column however few rows
-/// are wanted. Building one block instead costs one block. Measured on 500,000
-/// distinct strings, reading a single 8,192-row page fell from 3 ms to under
-/// one tenth of that.
+/// A variable-width column gains even uncompressed. The reason is Arrow's, not
+/// this format's. Arrow walks every offset of such a column to check the
+/// offsets are ordered and in bounds. For text it also checks every byte.
 ///
-/// A fixed-width column gains nothing: there are no offsets to walk, its checks
-/// are constant time, and cutting it would only add blocks to stitch together.
+/// Both checks cost the whole column, however few rows a reader wants. One
+/// block costs one block. Measured on 500,000 distinct strings: one 8,192-row
+/// page fell from 3 ms to under a tenth of that.
+///
+/// A fixed-width column gains nothing. It has no offsets to walk, its checks
+/// are constant time, and blocks would only add pieces to stitch together.
 fn worth_blocking(codec: Codec, data_type: &DataType) -> bool {
     if codec != Codec::None {
         return true;
