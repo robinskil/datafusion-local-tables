@@ -124,6 +124,20 @@ pub struct TableOptions {
     /// This is a layout, not an index: it stores no extra bytes and cannot
     /// affect what a query returns.
     pub cluster_by: Vec<String>,
+    /// Source bytes a rewrite holds in memory at once.
+    ///
+    /// Compaction and every rewrite read stored rows back before writing them
+    /// out again. Reading all of them first is simple and unbounded: a table
+    /// larger than memory cannot be compacted at all, and neither can its
+    /// schema be changed. Instead the work is cut into runs whose source
+    /// segments total no more than this, measured as the bytes they occupy on
+    /// disk. A run always holds at least one segment, so a single segment
+    /// larger than the budget is still the floor.
+    ///
+    /// Clustering is applied within a run, so a table larger than the budget
+    /// comes out clustered in runs rather than as a whole. Raising this trades
+    /// memory for a better layout.
+    pub compaction_max_bytes: u64,
     /// Which columns get a membership filter.
     pub bloom_filters: BloomFilters,
     /// Which text columns get a trigram filter, for `LIKE` pruning.
@@ -156,6 +170,7 @@ impl Default for TableOptions {
             dictionary_encoding: true,
             rle_encoding: true,
             cluster_by: Vec::new(),
+            compaction_max_bytes: 256 * 1024 * 1024,
             bloom_filters: BloomFilters::default(),
             trigram_filters: BloomFilters::default(),
             bloom_bits_per_value: crate::columnar::bloom::DEFAULT_BITS_PER_VALUE,

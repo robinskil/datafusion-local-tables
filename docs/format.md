@@ -348,8 +348,33 @@ table.rewrite_all().await?;
 `rewrite_all` is compaction over every live segment. It applies the current
 options to data already stored, which is how a table acquires a membership
 filter, a trigram filter or a z-order it was not created with, and how it sheds
-one. It reads every live row into memory, so it is maintenance rather than
-something to run under load.
+one.
+
+### What a rewrite holds
+
+Every rewrite reads stored rows back before writing them out again. Reading all
+of them first is simple and unbounded: a table larger than memory could then
+never be compacted, and its schema could never change.
+
+Instead the work is cut into runs whose source segments total no more than
+`compaction_max_bytes`, measured as the bytes they occupy on disk. A run always
+holds at least one segment, so one segment larger than the budget is a run on
+its own: a segment is the smallest unit a rewrite can work in.
+
+Compaction commits **once per run**. That keeps the writer lock short and leaves
+a valid table at every point: a run that fails leaves the runs before it
+compacted and the rest untouched, and running again finishes the job.
+
+A schema change cannot be split that way. A half-converted table would hold
+segments of two different types and nothing could read it, so the conversion and
+the new schema go into one commit however large the table is. What it bounds is
+what it holds while it works, streaming a run at a time into the same commit.
+Its reads happen under the writer lock, unlike compaction's, which costs nothing
+because a schema change already refuses to run alongside a write.
+
+Clustering is applied within a run, so a table larger than the budget comes out
+clustered in runs rather than as a whole. Raising the budget trades memory for a
+better layout.
 
 Rewriting to cluster by one column costs another its locality, since there is
 only one row order. A trigram filter on text that was grouped by segment before

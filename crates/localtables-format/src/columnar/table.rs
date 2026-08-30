@@ -483,8 +483,9 @@ impl ColumnarTable {
         // large one gets groups near the cap rather than thousands of tiny ones.
         let total_rows = manifest.total_rows() + frozen.rows;
         let group_rows = self.inner.options.row_group_size_for(total_rows);
-        for group in self.row_groups(frozen.batches, group_rows)? {
-            self.write_segment(&writer.file, &mut manifest, &group, min_active)
+        let current = self.table_schema();
+        for group in self.row_groups(frozen.batches, group_rows, &current)? {
+            self.write_segment(&writer.file, &mut manifest, &group, &current, min_active)
                 .await?;
         }
 
@@ -536,8 +537,8 @@ impl ColumnarTable {
         &self,
         batches: Vec<RecordBatch>,
         group_rows: usize,
+        current: &TableSchema,
     ) -> Result<Vec<Vec<RecordBatch>>> {
-        let current = self.table_schema();
         if current.cluster_columns.is_empty() {
             return Ok(split_row_groups(batches, group_rows));
         }
@@ -554,6 +555,7 @@ impl ColumnarTable {
         file: &TableFile,
         manifest: &mut Manifest,
         batches: &[RecordBatch],
+        current: &TableSchema,
         min_active_txn: u64,
     ) -> Result<u64> {
         let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
@@ -562,7 +564,6 @@ impl ColumnarTable {
         }
 
         let segment_id = manifest.next_segment_id;
-        let current = self.table_schema();
         let built = build_segment(
             segment_id,
             &current.schema,
@@ -611,14 +612,26 @@ impl ColumnarTable {
 
     /// Open a segment for reading, keeping its bytes alive through the reader.
     pub async fn segment_reader(&self, entry: &SegmentEntry) -> Result<SegmentReader> {
+        self.segment_reader_as(entry, &self.table_schema()).await
+    }
+
+    /// Open a segment under a schema that is not necessarily the current one.
+    ///
+    /// A rewrite reads under the schema the segments were written with and
+    /// writes under the one replacing it, in the same pass, so neither can be
+    /// taken from the handle.
+    async fn segment_reader_as(
+        &self,
+        entry: &SegmentEntry,
+        schema: &TableSchema,
+    ) -> Result<SegmentReader> {
         let bytes = self.inner.io.read_immutable(entry.data).await?;
-        let current = self.table_schema();
         SegmentReader::new(
             bytes,
             entry.data.offset,
             entry.meta,
-            current.schema.clone(),
-            &current.layout,
+            schema.schema.clone(),
+            &schema.layout,
         )
     }
 
@@ -629,7 +642,18 @@ impl ColumnarTable {
         entry: &SegmentEntry,
         projection: Option<&[usize]>,
     ) -> Result<Vec<RecordBatch>> {
-        let reader = self.segment_reader(entry).await?;
+        self.read_segment_as(snapshot, entry, projection, &self.table_schema())
+            .await
+    }
+
+    async fn read_segment_as(
+        &self,
+        snapshot: &Snapshot,
+        entry: &SegmentEntry,
+        projection: Option<&[usize]>,
+        schema: &TableSchema,
+    ) -> Result<Vec<RecordBatch>> {
+        let reader = self.segment_reader_as(entry, schema).await?;
         let full = reader.read(projection)?;
 
         let filtered = match snapshot.deletes_for(entry.segment_id) {
@@ -829,17 +853,8 @@ impl ColumnarTable {
         let before = self.table_schema();
         let after = Arc::new(TableSchema::new(schema, &self.inner.options.cluster_by)?);
 
-        // Read under the old schema, outside the writer lock.
         let snapshot = self.snapshot();
         let sources: Vec<SegmentEntry> = snapshot.live_segments().cloned().collect();
-        let mut converted: Vec<RecordBatch> = Vec::new();
-        if rewrite {
-            for entry in &sources {
-                for batch in self.read_segment(&snapshot, entry, None).await? {
-                    converted.push(convert(&batch, &before.schema, &after.schema)?);
-                }
-            }
-        }
 
         let mut writer = self.inner.writer.lock().await;
         if !writer.memtable.is_empty() {
@@ -856,24 +871,49 @@ impl ColumnarTable {
         let min_active = self.inner.registry.min_active_txn();
 
         if rewrite {
-            // The new schema has to be in force before a segment is written
-            // under it, and the write is what could fail, so it is put back on
-            // any error below.
-            self.inner.schema.store(after.clone());
-            let rows: u64 = converted.iter().map(|b| b.num_rows() as u64).sum();
+            // Read under the old schema and write under the new one, a run of
+            // segments at a time rather than the whole table at once. The
+            // conversion has to reach disk in the same commit as the schema, so
+            // this cannot be split across commits the way compaction is; what
+            // it can do is bound what it holds while it works.
+            //
+            // The reads happen under the writer lock, unlike compaction's. A
+            // schema change already refuses to run alongside a write, so there
+            // is nothing to yield the lock for.
+            let budget = self.inner.options.compaction_max_bytes.max(1);
+            let rows: u64 = sources.iter().map(|entry| entry.row_count).sum();
             let group_rows = self.inner.options.row_group_size_for(rows);
+
             let written = async {
-                for group in self.row_groups(converted, group_rows)? {
-                    self.write_segment(&writer.file, &mut manifest, &group, min_active)
+                let mut pending: Vec<RecordBatch> = Vec::new();
+                let mut pending_bytes = 0u64;
+                for entry in &sources {
+                    for batch in self
+                        .read_segment_as(&snapshot, entry, None, &before)
+                        .await?
+                    {
+                        pending.push(convert(&batch, &before.schema, &after.schema)?);
+                    }
+                    pending_bytes += entry.data.len;
+                    if pending_bytes < budget {
+                        continue;
+                    }
+                    for group in
+                        self.row_groups(std::mem::take(&mut pending), group_rows, &after)?
+                    {
+                        self.write_segment(&writer.file, &mut manifest, &group, &after, min_active)
+                            .await?;
+                    }
+                    pending_bytes = 0;
+                }
+                for group in self.row_groups(pending, group_rows, &after)? {
+                    self.write_segment(&writer.file, &mut manifest, &group, &after, min_active)
                         .await?;
                 }
                 Ok::<(), Error>(())
             }
             .await;
-            if let Err(error) = written {
-                self.inner.schema.store(before);
-                return Err(error);
-            }
+            written?;
 
             manifest
                 .segments
@@ -902,15 +942,66 @@ impl ColumnarTable {
                 self.publish(&writer)?;
                 Ok(())
             }
-            Err(error) => {
-                self.inner.schema.store(before);
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
-    /// Rewrite the named segments into one, dropping their deleted rows.
+    /// Rewrite the named segments, dropping their deleted rows.
+    ///
+    /// The work is cut into runs of at most
+    /// [`TableOptions::compaction_max_bytes`] of source data, and **each run is
+    /// its own commit**. Reading every row first would be simpler and would
+    /// mean a table larger than memory could never be compacted at all.
+    ///
+    /// Committing per run also keeps the writer lock short, and leaves a valid
+    /// table at every point: a run that fails leaves the runs before it
+    /// compacted and the rest untouched, and running again finishes the job.
+    /// The count returned covers the runs that committed.
     pub async fn compact_segments(&self, segment_ids: &[SegmentId]) -> Result<u64> {
+        if segment_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let snapshot = self.snapshot();
+        let mut rows = 0;
+        for run in self.runs(&snapshot, segment_ids)? {
+            rows += self.compact_run(&run).await?;
+        }
+        Ok(rows)
+    }
+
+    /// Cut segments into runs that each fit the memory budget.
+    ///
+    /// A run always holds at least one segment, so a segment larger than the
+    /// budget is a run on its own rather than an error: one segment is the
+    /// smallest unit a rewrite can work in.
+    fn runs(&self, snapshot: &Snapshot, segment_ids: &[SegmentId]) -> Result<Vec<Vec<SegmentId>>> {
+        let budget = self.inner.options.compaction_max_bytes.max(1);
+        let mut runs: Vec<Vec<SegmentId>> = Vec::new();
+        let mut bytes = 0u64;
+
+        for segment_id in segment_ids {
+            let Some(entry) = snapshot.manifest.segment(*segment_id) else {
+                return Err(Error::InvalidArgument(format!(
+                    "segment {segment_id} is not in this table"
+                )));
+            };
+            let size = entry.data.len;
+            match runs.last_mut() {
+                Some(run) if bytes + size <= budget => {
+                    run.push(*segment_id);
+                    bytes += size;
+                }
+                _ => {
+                    runs.push(vec![*segment_id]);
+                    bytes = size;
+                }
+            }
+        }
+        Ok(runs)
+    }
+
+    async fn compact_run(&self, segment_ids: &[SegmentId]) -> Result<u64> {
         if segment_ids.is_empty() {
             return Ok(0);
         }
@@ -959,8 +1050,9 @@ impl ColumnarTable {
             .inner
             .options
             .row_group_size_for(manifest.total_rows().max(rows));
-        for group in self.row_groups(live, group_rows)? {
-            self.write_segment(&writer.file, &mut manifest, &group, min_active)
+        let current = self.table_schema();
+        for group in self.row_groups(live, group_rows, &current)? {
+            self.write_segment(&writer.file, &mut manifest, &group, &current, min_active)
                 .await?;
         }
 

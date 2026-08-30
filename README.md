@@ -50,7 +50,9 @@ clustering, projection and limit pushdown, crash-safe commits, a write-ahead
 log, and compaction.
 
 Filters and clustering are per-segment, so a table changes them by being
-rewritten: reopen with the options you want and call `rewrite_all`.
+rewritten: reopen with the options you want and call `rewrite_all`. Rewrites are
+cut into runs of bounded size rather than reading the whole table into memory,
+so a table larger than memory can still be compacted.
 
 The schema can change too. Adding a nullable column and renaming one are single
 small commits; dropping a column and changing its type rewrite every segment, in
